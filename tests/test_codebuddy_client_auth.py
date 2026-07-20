@@ -45,11 +45,14 @@ async def empty_pool(monkeypatch, tmp_path):
     return manager
 
 
-def configure(monkeypatch, client_mode="passthrough", header_mode="bearer"):
+def configure(monkeypatch, client_mode="passthrough", header_mode="bearer", profile="cli"):
     monkeypatch.setattr(auth, "get_client_auth_mode", lambda: client_mode)
     monkeypatch.setattr(auth, "get_server_password", lambda: RELAY_PASSWORD)
     monkeypatch.setattr(auth, "get_admin_password", lambda: ADMIN_PASSWORD)
     monkeypatch.setattr(codebuddy_router, "get_upstream_api_key_header", lambda: header_mode)
+    # Pin the request profile to cli so the upstream header-mode mapping stays
+    # deterministic in these tests (the web profile always sends both headers).
+    monkeypatch.setattr(codebuddy_router, "get_codebuddy_request_profile", lambda: profile)
     monkeypatch.setattr(
         codebuddy_router.usage_stats_manager,
         "record_model_usage",

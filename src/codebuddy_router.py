@@ -5,6 +5,7 @@ Refactored version - improved code structure, error handling, and resource manag
 import json
 import time
 import uuid
+import hashlib
 import logging
 import asyncio
 from dataclasses import dataclass
@@ -23,7 +24,16 @@ from .codebuddy_api_key_manager import (
 from .codebuddy_token_manager import codebuddy_token_manager
 from .usage_stats_manager import usage_stats_manager
 from .keyword_replacer import apply_keyword_replacement_to_system_message
-from config import get_upstream_api_key_header
+from .codebuddy_message_sanitizer import (
+    is_codebuddy_moderation_response,
+    sanitize_messages,
+)
+from config import (
+    get_codebuddy_request_profile,
+    get_max_system_prompt_length,
+    get_sanitize_agent_prompt,
+    get_upstream_api_key_header,
+)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -448,6 +458,120 @@ class UpstreamAttemptError(Exception):
         self.code = code
 
 
+class CodeBuddyModerationError(Exception):
+    """Raised when CodeBuddy rejects a request via its content moderation.
+
+    This is distinct from an upstream failure: the key is valid and the
+    request reached upstream. It must not trigger key failover or retries.
+    """
+
+
+# Human-readable message returned to the client on a moderation rejection.
+MODERATION_MESSAGE = (
+    "CodeBuddy rejected the request through its content moderation system. "
+    "This may be caused by the system prompt or conversation history."
+)
+
+# Shorter message used inside the streaming content_filter delta.
+MODERATION_STREAM_MESSAGE = (
+    "CodeBuddy rejected the request through its content moderation system."
+)
+
+# Number of assistant-content characters to buffer while deciding whether a
+# streaming response is a moderation refusal. The Mandarin refusal is short and
+# self-contained, so a small buffer distinguishes it from a normal reply.
+MODERATION_STREAM_BUFFER_CHARS = 200
+
+
+def _extract_delta_content(sse_line: str) -> str:
+    """Return the assistant ``delta.content`` string from an OpenAI SSE line."""
+    obj = parse_sse_line(sse_line.strip())
+    if not obj:
+        return ""
+    try:
+        choices = obj.get("choices") or []
+        if not choices:
+            return ""
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
+        return content if isinstance(content, str) else ""
+    except (AttributeError, IndexError, TypeError):
+        return ""
+
+
+async def _moderation_stream() -> AsyncGenerator[str, None]:
+    """Yield an OpenAI-compatible content_filter SSE stream, ending with [DONE]."""
+    chunk = {
+        "id": "chatcmpl-codebuddy-filter",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": MODERATION_STREAM_MESSAGE},
+                "finish_reason": "content_filter",
+            }
+        ],
+    }
+    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def _key_fingerprint(token: Optional[str]) -> str:
+    """Return a short, non-reversible SHA-256 fingerprint of an API key.
+
+    Used only for safe diagnostics. The raw key is never logged.
+    """
+    if not token:
+        return "none"
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+
+
+def _log_request_diagnostics(
+    *,
+    payload: Dict[str, Any],
+    client_wants_stream: bool,
+    system_prompt_sanitized: bool,
+    request_profile: str,
+    key_fingerprint: str,
+) -> None:
+    """Log request metadata only. Never logs keys, prompts, or user content."""
+    messages = payload.get("messages", []) or []
+    roles: List[str] = []
+    content_lengths: List[int] = []
+    tool_count = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        roles.append(str(msg.get("role", "unknown")))
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            content_lengths.append(len(content))
+        elif isinstance(content, list):
+            length = 0
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") in {"tool_use", "tool_result"}:
+                        tool_count += 1
+                    length += len(str(item.get("text", ""))) if item.get("type") == "text" else 0
+            content_lengths.append(length)
+        else:
+            content_lengths.append(0)
+    tool_count += len(payload.get("tools", []) or [])
+    logger.info(
+        "CodeBuddy request model=%s stream=%s roles=[%s] content_lengths=%s "
+        "tool_count=%d system_prompt_sanitized=%s request_profile=%s key_fingerprint=%s",
+        payload.get("model", "unknown"),
+        client_wants_stream,
+        ",".join(roles),
+        content_lengths,
+        tool_count,
+        system_prompt_sanitized,
+        request_profile,
+        key_fingerprint,
+    )
+
+
 class CodeBuddyStreamService:
     """CodeBuddy streaming service; each method performs exactly one upstream attempt."""
 
@@ -521,10 +645,25 @@ class CodeBuddyStreamService:
                 yield buffer + '\n'
 
         stream = converted_chunks()
+
+        # Pre-buffer the leading chunks so a Mandarin moderation refusal can be
+        # detected before any assistant content is sent downstream. The refusal
+        # is short, so a small buffer suffices; normal replies simply get
+        # replayed afterwards in order.
+        buffered_lines: List[str] = []
+        accumulated_content = ""
+        moderation_detected = False
         try:
-            first_chunk = await anext(stream)
-        except StopAsyncIteration:
-            first_chunk = None
+            async for line in stream:
+                buffered_lines.append(line)
+                if '[DONE]' in line:
+                    break
+                accumulated_content += _extract_delta_content(line)
+                if is_codebuddy_moderation_response(accumulated_content):
+                    moderation_detected = True
+                    break
+                if len(accumulated_content) >= MODERATION_STREAM_BUFFER_CHARS:
+                    break
         except httpx.TimeoutException as exc:
             await response.aclose()
             raise UpstreamAttemptError("transient", 504, "upstream_timeout") from exc
@@ -535,10 +674,26 @@ class CodeBuddyStreamService:
             await response.aclose()
             raise UpstreamAttemptError("fatal", 502, "upstream_response_invalid") from exc
 
+        if moderation_detected:
+            # Nothing normal was sent yet: replace the whole stream with an
+            # OpenAI-compatible content_filter stream. The key is valid, so do
+            # not mark it failed or fail over.
+            await response.aclose()
+
+            async def moderation_core():
+                async for item in _moderation_stream():
+                    yield item
+
+            return StreamingResponse(
+                moderation_core(), media_type="text/event-stream", headers={
+                    **SSE_HEADERS, "X-CodeBuddy-Moderation": "true"
+                }
+            )
+
         async def stream_core():
             try:
-                if first_chunk is not None:
-                    yield first_chunk
+                for line in buffered_lines:
+                    yield line
                 async for chunk in stream:
                     yield chunk
             except httpx.RequestError:
@@ -587,10 +742,12 @@ class CodeBuddyStreamService:
 
         try:
             aggregator = StreamResponseAggregator()
+            raw_text = ""
             buffer = ""
             async for chunk in response.aiter_text():
                 if not chunk:
                     continue
+                raw_text += chunk
                 buffer += chunk
                 while '\n' in buffer:
                     line, buffer = buffer.split('\n', 1)
@@ -602,7 +759,7 @@ class CodeBuddyStreamService:
                 obj = parse_sse_line(buffer.strip())
                 if obj:
                     aggregator.process_chunk(obj)
-            return aggregator.finalize()
+            final = aggregator.finalize()
         except httpx.RequestError as exc:
             raise UpstreamAttemptError("transient", 502, "upstream_network_error") from exc
         except UpstreamAttemptError:
@@ -610,27 +767,68 @@ class CodeBuddyStreamService:
         except Exception as exc:
             raise UpstreamAttemptError("fatal", 502, "upstream_response_invalid") from exc
 
+        # Detect a CodeBuddy moderation refusal in either the aggregated
+        # assistant content or the raw upstream body (covers nested/non-SSE
+        # bodies). This is not an upstream failure, so it must not trigger
+        # key failover.
+        aggregated_content = ""
+        try:
+            aggregated_content = final["choices"][0]["message"].get("content") or ""
+        except (KeyError, IndexError, TypeError):
+            aggregated_content = ""
+        if is_codebuddy_moderation_response(aggregated_content) or \
+                is_codebuddy_moderation_response(raw_text):
+            raise CodeBuddyModerationError()
+        return final
+
 class RequestProcessor:
     """Request preprocessor - thread-safe request handling"""
 
     @staticmethod
-    def prepare_payload(request_body: Dict[str, Any]) -> Dict[str, Any]:
-        """Prepare the request payload"""
+    def prepare_payload(request_body: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+        """Prepare the request payload.
+
+        Returns the upstream payload and a flag indicating whether an agent
+        system prompt was sanitized. The flag is used only for safe diagnostics
+        and is never sent upstream.
+        """
         payload = request_body.copy()
         payload["stream"] = True  # CodeBuddy only supports streaming requests
 
-        # Handle the message count requirement: CodeBuddy requires at least 2 messages
         messages = payload.get("messages", [])
-        if len(messages) == 1 and messages[0].get("role") == "user":
-            system_msg = {"role": "system", "content": "You are a helpful assistant."}
-            payload["messages"] = [system_msg] + messages
-        
-        # Apply keyword replacement
-        for msg in payload.get("messages", []):
-            if msg.get("role") == "system":
+
+        # Sanitize only agent system prompts that tend to trigger false-positive
+        # moderation. User/assistant/tool messages are never modified, and
+        # legitimate short system prompts are left intact.
+        try:
+            sanitize_enabled = get_sanitize_agent_prompt()
+            max_len = get_max_system_prompt_length()
+        except Exception:
+            sanitize_enabled, max_len = True, 2000
+        messages, system_prompt_sanitized = sanitize_messages(
+            messages, enabled=sanitize_enabled, max_system_prompt_length=max_len
+        )
+
+        # CodeBuddy requires at least two messages. Only add a default system
+        # prompt when there is no system message already, to avoid duplicating
+        # system messages or reordering the conversation.
+        has_system = any(
+            isinstance(m, dict) and m.get("role") == "system" for m in messages
+        )
+        if not has_system and len(messages) == 1 and messages[0].get("role") == "user":
+            system_msg = {
+                "role": "system",
+                "content": "You are a helpful assistant. Reply in the same language as the user.",
+            }
+            messages = [system_msg] + messages
+
+        # Apply keyword replacement to system messages only.
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "system":
                 msg["content"] = apply_keyword_replacement_to_system_message(msg.get("content"))
-        
-        return payload
+
+        payload["messages"] = messages
+        return payload, system_prompt_sanitized
     
     @staticmethod
     def validate_request(request_body: Dict[str, Any]) -> None:
@@ -797,12 +995,22 @@ async def chat_completions(
                 503,
             )
 
-    payload = RequestProcessor.prepare_payload(request_body)
+    payload, system_prompt_sanitized = RequestProcessor.prepare_payload(request_body)
     usage_stats_manager.record_model_usage(payload.get("model", "unknown"))
     service = CodeBuddyStreamService()
     client_wants_stream = request_body.get("stream", False)
     excluded_ids: Set[str] = set()
     last_error: Optional[UpstreamAttemptError] = None
+
+    try:
+        request_profile = get_codebuddy_request_profile()
+    except ValueError:
+        return openai_error_response(
+            "Upstream request profile is misconfigured",
+            "configuration_error",
+            "request_profile_invalid",
+            500,
+        )
 
     for _attempt in range(max_attempts):
         if source == "passthrough":
@@ -827,6 +1035,15 @@ async def chat_completions(
                 500,
             )
 
+        # Safe diagnostics: metadata only, never key/prompt/user content.
+        _log_request_diagnostics(
+            payload=payload,
+            client_wants_stream=client_wants_stream,
+            system_prompt_sanitized=system_prompt_sanitized,
+            request_profile=request_profile,
+            key_fingerprint=_key_fingerprint(credential.bearer_token),
+        )
+
         headers = codebuddy_api_client.generate_codebuddy_headers(
             bearer_token=credential.bearer_token,
             user_id=credential.user_id,
@@ -835,6 +1052,7 @@ async def chat_completions(
             conversation_message_id=x_conversation_message_id,
             request_id=x_request_id,
             api_key_header=upstream_key_header,
+            profile=request_profile,
         )
 
         try:
@@ -847,6 +1065,26 @@ async def chat_completions(
             if credential.key_id is not None:
                 await codebuddy_api_key_manager.mark_success(credential.key_id)
             return result
+        except CodeBuddyModerationError:
+            # The key is valid and the request reached upstream; moderation is
+            # not a key failure. Mark success (no failover) and return a clear
+            # OpenAI-compatible content_filter error. Streaming moderation is
+            # already handled inside open_stream_response before this point.
+            if credential.key_id is not None:
+                await codebuddy_api_key_manager.mark_success(credential.key_id)
+            logger.info("CodeBuddy moderation rejection detected (non-stream)")
+            return JSONResponse(
+                status_code=400,
+                headers={"X-CodeBuddy-Moderation": "true"},
+                content={
+                    "error": {
+                        "message": MODERATION_MESSAGE,
+                        "type": "content_filter",
+                        "param": None,
+                        "code": "codebuddy_content_filter",
+                    }
+                },
+            )
         except UpstreamAttemptError as error:
             last_error = error
             await record_attempt_error(credential, error)

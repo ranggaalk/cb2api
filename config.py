@@ -38,7 +38,10 @@ _DEFAULT_CONFIG = {
     "CODEBUDDY_API_KEY_COOLDOWN_SECONDS": 300,
     "CODEBUDDY_CLIENT_AUTH_MODE": "relay",
     "CODEBUDDY_ADMIN_PASSWORD": None,
-    "CODEBUDDY_UPSTREAM_API_KEY_HEADER": "bearer"
+    "CODEBUDDY_UPSTREAM_API_KEY_HEADER": "bearer",
+    "CODEBUDDY_REQUEST_PROFILE": "web",
+    "CODEBUDDY_SANITIZE_AGENT_PROMPT": True,
+    "CODEBUDDY_MAX_SYSTEM_PROMPT_LENGTH": 2000
 }
 
 # --- Core Functions ---
@@ -151,6 +154,33 @@ def get_upstream_api_key_header() -> str:
             "CODEBUDDY_UPSTREAM_API_KEY_HEADER must be x-api-key, bearer, or both"
         )
     return mode
+
+def get_codebuddy_request_profile() -> str:
+    profile = str(_get_config_value("CODEBUDDY_REQUEST_PROFILE")).strip().lower()
+    if profile not in {"web", "cli"}:
+        raise ValueError("CODEBUDDY_REQUEST_PROFILE must be web or cli")
+    return profile
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"true", "1", "t", "y", "yes"}
+
+
+def get_sanitize_agent_prompt() -> bool:
+    return _coerce_bool(_get_config_value("CODEBUDDY_SANITIZE_AGENT_PROMPT"), True)
+
+
+def get_max_system_prompt_length() -> int:
+    try:
+        value = int(_get_config_value("CODEBUDDY_MAX_SYSTEM_PROMPT_LENGTH"))
+    except (TypeError, ValueError):
+        return 2000
+    return value if value > 0 else 2000
+
 
 def get_codebuddy_api_endpoint() -> str:
     return str(_get_config_value("CODEBUDDY_API_ENDPOINT"))

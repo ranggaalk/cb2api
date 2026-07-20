@@ -164,6 +164,12 @@ class CodeBuddyAPIClient:
 
         return codebuddy_messages
 
+    # Browser-compatible User-Agent used by the "web" request profile.
+    _WEB_USER_AGENT = (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    )
+
     def generate_codebuddy_headers(
         self,
         bearer_token: str,
@@ -172,19 +178,55 @@ class CodeBuddyAPIClient:
         conversation_request_id: Optional[str] = None,
         conversation_message_id: Optional[str] = None,
         request_id: Optional[str] = None,
-        api_key_header: str = "bearer"
+        api_key_header: str = "bearer",
+        profile: str = "web"
     ) -> Dict[str, str]:
         """
         Generate the complete header set required by the CodeBuddy API.
+
+        The request profile controls which identity is presented upstream:
+
+          * ``web``  - browser User-Agent, always sends both ``Authorization``
+                        and ``X-Api-Key``, and omits CLI/IDE identity headers.
+                        This is less likely to trigger false-positive
+                        moderation.
+          * ``cli``  - preserves the legacy CLI/IDE headers (X-IDE-*,
+                        x-stainless-*, CLI User-Agent) for backward
+                        compatibility, honoring ``api_key_header``.
+
         Prefer supplied conversation IDs and generate missing IDs automatically.
         """
         if api_key_header not in {"x-api-key", "bearer", "both"}:
             raise ValueError("api_key_header must be x-api-key, bearer, or both")
+        if profile not in {"web", "cli"}:
+            raise ValueError("profile must be web or cli")
+
+        # Shared conversation/routing headers used by both profiles.
         headers = {
             'Host': 'www.codebuddy.ai',
-            'Accept': 'application/json',
             'Content-Type': 'application/json',
             'X-Requested-With': 'XMLHttpRequest',
+            'X-Conversation-ID': conversation_id or str(uuid.uuid4()),
+            'X-Conversation-Request-ID': conversation_request_id or secrets.token_hex(16),
+            'X-Conversation-Message-ID': conversation_message_id or str(uuid.uuid4()).replace('-', ''),
+            'X-Request-ID': request_id or str(uuid.uuid4()).replace('-', ''),
+            'X-Domain': 'www.codebuddy.ai',
+            'X-Product': 'SaaS',
+            'X-User-Id': user_id or 'b5be3a67-237e-4ee6-9b9a-0b9ecd7b454b',
+        }
+
+        if profile == "web":
+            # Browser-like identity. Always send both auth headers so the
+            # request matches what web/other adapters send upstream.
+            headers['Accept'] = 'text/event-stream'
+            headers['User-Agent'] = self._WEB_USER_AGENT
+            headers["X-API-Key"] = bearer_token
+            headers["Authorization"] = f"Bearer {bearer_token}"
+            return headers
+
+        # Legacy CLI profile: keep IDE identity headers and honor api_key_header.
+        headers['Accept'] = 'application/json'
+        headers.update({
             'x-stainless-arch': 'x64',
             'x-stainless-lang': 'js',
             'x-stainless-os': 'Windows',
@@ -192,19 +234,12 @@ class CodeBuddyAPIClient:
             'x-stainless-retry-count': '0',
             'x-stainless-runtime': 'node',
             'x-stainless-runtime-version': 'v22.13.1',
-            'X-Conversation-ID': conversation_id or str(uuid.uuid4()),
-            'X-Conversation-Request-ID': conversation_request_id or secrets.token_hex(16),
-            'X-Conversation-Message-ID': conversation_message_id or str(uuid.uuid4()).replace('-', ''),
-            'X-Request-ID': request_id or str(uuid.uuid4()).replace('-', ''),
             'X-Agent-Intent': 'craft',
             'X-IDE-Type': 'CLI',
             'X-IDE-Name': 'CLI',
             'X-IDE-Version': '1.0.7',
-            'X-Domain': 'www.codebuddy.ai',
             'User-Agent': 'CLI/1.0.7 CodeBuddy/1.0.7',
-            'X-Product': 'SaaS',
-            'X-User-Id': user_id or 'b5be3a67-237e-4ee6-9b9a-0b9ecd7b454b'
-        }
+        })
         if api_key_header in {"x-api-key", "both"}:
             headers["X-API-Key"] = bearer_token
         if api_key_header in {"bearer", "both"}:
