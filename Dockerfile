@@ -1,37 +1,35 @@
-# 使用官方的、轻量级的 Python 镜像作为基础
+# Use the official lightweight Python image as the base.
 FROM python:3.11-slim
 
-# 设置容器内的工作目录
+# Set the container working directory.
 WORKDIR /app
 
-# 复制依赖文件
+# Copy the dependency file.
 COPY requirements.txt .
 
-# 安装依赖
-# --no-cache-dir 选项可以减小镜像体积
+# Install dependencies. --no-cache-dir reduces the image size.
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 将项目的所有文件复制到工作目录中
+# Copy the project into the working directory.
 COPY . .
 
-# 安装 gosu，一个轻量级的 su/sudo 替代品，用于在脚本中切换用户
-# 并在同一层中进行清理以减小镜像体积
+# Install gosu, a lightweight su/sudo alternative used to switch users.
+# Clean package metadata in the same layer to reduce image size.
 RUN apt-get update && \
     apt-get install -y gosu && \
     rm -rf /var/lib/apt/lists/*
 
-# 复制并设置入口脚本
+# Install the container entrypoint.
 COPY entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["entrypoint.sh"]
 
-# 创建一个非root用户来运行应用
+# Create a non-root user for the application.
 RUN useradd -m -u 1001 appuser
 
-# 声明容器将要监听的端口
-# 这个端口应该与您在配置中设置的 CODEBUDDY_PORT 一致
+# Document the port exposed by the container.
+# This should match the internal CODEBUDDY_PORT configuration.
 EXPOSE 8001
 
-# 定义容器启动时要执行的命令
-# 使用 Hypercorn 启动，它是一个生产级的 ASGI 服务器
+# Start the production ASGI server with Hypercorn.
 CMD ["hypercorn", "web:app", "--bind", "0.0.0.0:8001"]

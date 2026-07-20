@@ -1,5 +1,5 @@
 """
-CodeBuddy API Client - 直接调用CodeBuddy API
+CodeBuddy API Client - Calls the CodeBuddy API directly.
 """
 import json
 import time
@@ -13,88 +13,87 @@ logger = logging.getLogger(__name__)
 
 
 class CodeBuddyAPIClient:
-    """CodeBuddy API客户端"""
-    
+    """CodeBuddy API client."""
+
     def __init__(self):
         from config import get_codebuddy_api_endpoint
         self.base_url = get_codebuddy_api_endpoint()
-        self.api_endpoint = self.base_url  # 直接使用base_url，不需要plugin前缀
-        
+        self.api_endpoint = self.base_url  # Use base_url directly; no plugin prefix is required.
+
     def convert_openai_to_codebuddy_messages(self, openai_messages: List[Dict]) -> List[Dict]:
-        """将OpenAI格式消息转换为CodeBuddy格式"""
+        """Convert OpenAI-format messages to CodeBuddy format."""
         codebuddy_messages = []
-        
-        # 过滤掉包含错误信息的消息，防止触发11128渠道检测
+
+        # Filter messages containing errors to avoid triggering channel detection 11128.
         filtered_messages = []
         for msg in openai_messages:
             content = msg.get("content", "")
-            # 跳过包含API错误信息的助手消息
-            if (msg.get("role") == "assistant" and 
-                isinstance(content, str) and 
+            # Skip assistant messages containing API error text.
+            if (msg.get("role") == "assistant" and
+                isinstance(content, str) and
                 ("Error: API error" in content or "API error:" in content)):
                 continue
             filtered_messages.append(msg)
-        
-        # CodeBuddy要求至少2条消息，如果只有1条用户消息，添加系统消息
+
+        # CodeBuddy requires at least two messages. Add a system message when only one user message exists.
         if len(filtered_messages) == 1 and filtered_messages[0].get("role") == "user":
             system_msg = {
                 "role": "system",
                 "content": "You are a helpful assistant."
             }
             codebuddy_messages.append(system_msg)
-        
+
         for msg in filtered_messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            
+
             logger.debug(f"[DEBUG] Processing message - role: {role}, content type: {type(content)}")
-            
-            # 处理特殊的tool角色，转换为user角色
+
+            # Convert the special tool role to a user role.
             if role == "tool":
                 role = "user"
-                logger.info(f"[ROLE_CONVERSION] Converting 'tool' role to 'user'")
-            
-            # 检查是否包含工具调用相关内容
+                logger.info("[ROLE_CONVERSION] Converting 'tool' role to 'user'")
+
+            # Detect tool-call content.
             has_tool_content = False
-            
-            # 检查字符串化的JSON内容
+
+            # Parse stringified JSON content.
             if isinstance(content, str) and content.startswith('[{') and content.endswith('}]'):
                 try:
                     parsed_content = json.loads(content)
                     if isinstance(parsed_content, list):
                         content = parsed_content
-                        logger.info(f"[JSON_PARSE] Parsed stringified JSON content")
+                        logger.info("[JSON_PARSE] Parsed stringified JSON content")
                 except json.JSONDecodeError:
                     pass
-            
+
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and item.get("type") in ["tool_result", "tool_use"]:
                         has_tool_content = True
                         break
-            
+
             if has_tool_content:
-                # 包含工具调用内容，保持结构化格式
+                # Preserve structured tool-call content.
                 logger.info(f"[TOOL_CONTENT] Preserving structured content for role: {role}")
-                
-                # 确保工具结果有正确的toolUseId
+
+                # Ensure every tool result has a valid toolUseId.
                 processed_content = []
                 for item in content:
                     if isinstance(item, dict):
                         if item.get("type") == "tool_result":
-                            # 确保toolUseId存在且有效
                             tool_use_id = item.get("toolUseId") or item.get("tool_use_id") or item.get("id")
                             if not tool_use_id:
-                                # 生成一个有效的toolUseId
+                                # Generate a valid toolUseId.
                                 tool_use_id = f"tool_{uuid.uuid4().hex[:8]}"
                                 logger.warning(f"[TOOL_RESULT] Missing toolUseId, generated: {tool_use_id}")
-                            
-                            # 确保toolUseId符合正则表达式要求 [a-zA-Z0-9_-]+
+
+                            # Ensure toolUseId matches [a-zA-Z0-9_-]+.
                             if not tool_use_id or not all(c.isalnum() or c in '_-' for c in tool_use_id):
                                 tool_use_id = f"tool_{uuid.uuid4().hex[:8]}"
                                 logger.warning(f"[TOOL_RESULT] Invalid toolUseId format, regenerated: {tool_use_id}")
-                            
-                            # 标准化工具结果格式
+
+                            # Normalize the tool-result format.
                             tool_result = {
                                 "type": "tool_result",
                                 "toolUseId": tool_use_id,
@@ -103,7 +102,7 @@ class CodeBuddyAPIClient:
                             processed_content.append(tool_result)
                             logger.info(f"[TOOL_RESULT] Processed tool result with toolUseId: {tool_use_id}")
                         elif item.get("type") == "tool_use":
-                            # 确保工具使用有正确的id
+                            # Ensure every tool use has an ID.
                             tool_id = item.get("id") or f"tool_{uuid.uuid4().hex[:8]}"
                             tool_use = {
                                 "type": "tool_use",
@@ -114,12 +113,11 @@ class CodeBuddyAPIClient:
                             processed_content.append(tool_use)
                             logger.info(f"[TOOL_USE] Processed tool use with id: {tool_id}")
                         elif item.get("type") == "text":
-                            # 处理纯文本内容
+                            # Preserve plain text content.
                             processed_content.append(item)
                         else:
-                            # 其他类型，可能是工具结果的简化格式
+                            # Convert simplified tool-result formats when possible.
                             if "text" in item and not item.get("type"):
-                                # 可能是工具结果，转换为标准格式
                                 tool_use_id = f"tool_{uuid.uuid4().hex[:8]}"
                                 tool_result = {
                                     "type": "tool_result",
@@ -132,13 +130,13 @@ class CodeBuddyAPIClient:
                                 processed_content.append(item)
                     else:
                         processed_content.append(item)
-                
+
                 codebuddy_msg = {
                     "role": role,
                     "content": processed_content
                 }
             else:
-                # 普通文本内容，转换为字符串
+                # Convert ordinary text content to a string.
                 if isinstance(content, str):
                     text_content = content
                 elif isinstance(content, list):
@@ -161,9 +159,9 @@ class CodeBuddyAPIClient:
                     "role": role,
                     "content": text_content
                 }
-            
+
             codebuddy_messages.append(codebuddy_msg)
-        
+
         return codebuddy_messages
 
     def generate_codebuddy_headers(
@@ -173,12 +171,15 @@ class CodeBuddyAPIClient:
         conversation_id: Optional[str] = None,
         conversation_request_id: Optional[str] = None,
         conversation_message_id: Optional[str] = None,
-        request_id: Optional[str] = None
+        request_id: Optional[str] = None,
+        api_key_header: str = "bearer"
     ) -> Dict[str, str]:
         """
-        生成CodeBuddy API所需的完整请求头。
-        优先使用传入的会话ID，如果未提供则随机生成。
+        Generate the complete header set required by the CodeBuddy API.
+        Prefer supplied conversation IDs and generate missing IDs automatically.
         """
+        if api_key_header not in {"x-api-key", "bearer", "both"}:
+            raise ValueError("api_key_header must be x-api-key, bearer, or both")
         headers = {
             'Host': 'www.codebuddy.ai',
             'Accept': 'application/json',
@@ -199,14 +200,17 @@ class CodeBuddyAPIClient:
             'X-IDE-Type': 'CLI',
             'X-IDE-Name': 'CLI',
             'X-IDE-Version': '1.0.7',
-            'Authorization': f'Bearer {bearer_token}',
             'X-Domain': 'www.codebuddy.ai',
             'User-Agent': 'CLI/1.0.7 CodeBuddy/1.0.7',
             'X-Product': 'SaaS',
             'X-User-Id': user_id or 'b5be3a67-237e-4ee6-9b9a-0b9ecd7b454b'
         }
+        if api_key_header in {"x-api-key", "both"}:
+            headers["X-API-Key"] = bearer_token
+        if api_key_header in {"bearer", "both"}:
+            headers["Authorization"] = f"Bearer {bearer_token}"
         return headers
 
 
-# 全局客户端实例
+# Global client instance.
 codebuddy_api_client = CodeBuddyAPIClient()

@@ -1,33 +1,39 @@
 """
-CodeBuddy API Router - 兼容CodeBuddy官方API格式
-重构版本 - 优化了代码结构、错误处理和资源管理
+CodeBuddy API Router - compatible with the official CodeBuddy API format
+Refactored version - improved code structure, error handling, and resource management
 """
 import json
 import time
 import uuid
 import logging
 import asyncio
-from typing import Optional, Dict, Any, List, AsyncGenerator
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, AsyncGenerator, Set
 
 import httpx
 from fastapi import APIRouter, HTTPException, Depends, Request, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from .auth import authenticate
+from .auth import ClientAuthContext, authenticate_admin, authenticate_inference
 from .codebuddy_api_client import codebuddy_api_client
+from .codebuddy_api_key_manager import (
+    ApiKeyConfigurationError,
+    codebuddy_api_key_manager,
+)
 from .codebuddy_token_manager import codebuddy_token_manager
 from .usage_stats_manager import usage_stats_manager
 from .keyword_replacer import apply_keyword_replacement_to_system_message
+from config import get_upstream_api_key_header
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# --- 延迟加载配置常量 - 避免循环导入 ---
+# --- Lazily loaded configuration constants - avoids circular imports ---
 _codebuddy_api_url: Optional[str] = None
 _available_models: Optional[List[str]] = None
 
 def get_codebuddy_api_url() -> str:
-    """延迟加载 CodeBuddy API URL"""
+    """Lazily load the CodeBuddy API URL"""
     global _codebuddy_api_url
     if _codebuddy_api_url is None:
         from config import get_codebuddy_api_endpoint
@@ -35,82 +41,92 @@ def get_codebuddy_api_url() -> str:
     return _codebuddy_api_url
 
 def get_available_models_list() -> List[str]:
-    """延迟加载可用模型列表"""
+    """Lazily load the list of available models"""
     global _available_models
     if _available_models is None:
         from config import get_available_models
         _available_models = get_available_models()
     return _available_models
 
-# --- 配置管理 ---
+# --- Configuration management ---
 class SecurityConfig:
-    """安全配置管理器"""
-    
+    """Security configuration manager"""
+
     @staticmethod
     def get_ssl_verify() -> bool:
-        """获取SSL验证设置 - 默认关闭，可通过环境变量启用"""
+        """Get the SSL verification setting - disabled by default, can be enabled via environment variable"""
         import os
-        # 默认关闭SSL验证，只有明确设置为true时才启用
+        # SSL verification is disabled by default; only enabled when explicitly set to true
         ssl_verify_env = os.getenv("CODEBUDDY_SSL_VERIFY", "false").lower()
         ssl_verify = ssl_verify_env == "true"
-        
+
         if not ssl_verify:
-            logger.warning("⚠️  SSL验证已禁用 - 仅在开发环境使用！生产环境请设置 CODEBUDDY_SSL_VERIFY=true")
+            logger.warning("⚠️  SSL verification is disabled - for development use only! Set CODEBUDDY_SSL_VERIFY=true in production")
         
         return ssl_verify
 
-# --- HTTP 客户端配置 ---
+# --- HTTP client configuration ---
 HTTP_CLIENT_CONFIG = {
     "verify": SecurityConfig.get_ssl_verify(),
     "timeout": httpx.Timeout(300.0, connect=30.0, read=300.0),
     "limits": httpx.Limits(max_keepalive_connections=20, max_connections=100)
 }
 
-# --- 异步安全的 HTTP 客户端池 ---
+# --- Async-safe HTTP client pool ---
 _http_client_pool: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
 
 async def get_http_client() -> httpx.AsyncClient:
-    """获取全局 HTTP 客户端池 - 异步安全"""
+    """Get the global HTTP client pool - async-safe"""
     global _http_client_pool
     if _http_client_pool is None:
         async with _client_lock:
-            # 双重检查锁定模式 - 异步版本
+            # Double-checked locking pattern - async version
             if _http_client_pool is None:
                 _http_client_pool = httpx.AsyncClient(**HTTP_CLIENT_CONFIG)
     return _http_client_pool
 
 async def close_http_client():
-    """关闭全局 HTTP 客户端池 - 异步安全"""
+    """Close the global HTTP client pool - async-safe"""
     global _http_client_pool
     async with _client_lock:
         if _http_client_pool is not None:
             await _http_client_pool.aclose()
             _http_client_pool = None
 
-# --- 应用生命周期管理 ---
+# --- Application lifecycle management ---
 class AppLifecycleManager:
-    """应用生命周期管理器 - 处理资源清理"""
-    
+    """Application lifecycle manager - handles resource cleanup"""
+
     @staticmethod
     async def startup():
-        """应用启动时的初始化"""
-        logger.info("CodeBuddy Router 启动中...")
-        # 预热连接池
+        """Initialization at application startup"""
+        logger.info("CodeBuddy Router starting up...")
+        # Warm up the connection pool, and start API key file reloading only in the relevant auth modes
+        from config import get_codebuddy_auth_mode
+
         await get_http_client()
-        logger.info("HTTP 连接池已初始化")
-    
+        try:
+            auth_mode = get_codebuddy_auth_mode()
+        except ValueError:
+            auth_mode = "auto"
+            logger.error("Invalid CODEBUDDY_AUTH_MODE configuration")
+        if auth_mode in {"auto", "api_key_file"}:
+            await codebuddy_api_key_manager.start_periodic_reload()
+        logger.info("HTTP connection pool and API key pool initialized")
+
     @staticmethod
     async def shutdown():
-        """应用关闭时的清理"""
-        logger.info("CodeBuddy Router 关闭中...")
+        """Cleanup at application shutdown"""
+        logger.info("CodeBuddy Router shutting down...")
+        await codebuddy_api_key_manager.stop_periodic_reload()
         await close_http_client()
-        logger.info("资源清理完成")
+        logger.info("Resource cleanup complete")
 
-# 导出生命周期管理器供主应用使用
+# Export the lifecycle manager for use by the main application
 lifecycle_manager = AppLifecycleManager()
 
-# --- 标准响应头 ---
+# --- Standard response headers ---
 SSE_HEADERS = {
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
@@ -119,10 +135,10 @@ SSE_HEADERS = {
     "Access-Control-Allow-Headers": "*"
 }
 
-# --- 辅助函数 ---
+# --- Helper functions ---
 
 def format_sse_error(message: str, error_type: str = "stream_error") -> str:
-    """格式化SSE错误响应"""
+    """Format an SSE error response"""
     error_data = {
         "error": {
             "message": message,
@@ -132,18 +148,18 @@ def format_sse_error(message: str, error_type: str = "stream_error") -> str:
     return f'data: {json.dumps(error_data, ensure_ascii=False)}\n\n'
 
 class OpenAICompatibilityConverter:
-    """将CodeBuddy格式转换为OpenAI兼容格式"""
-    
+    """Convert the CodeBuddy format to the OpenAI-compatible format"""
+
     @staticmethod
     def convert_tool_call_id(codebuddy_id: str) -> str:
-        """转换工具调用ID格式: tooluse_xxx -> call_xxx"""
+        """Convert the tool call ID format: tooluse_xxx -> call_xxx"""
         if codebuddy_id.startswith('tooluse_'):
             return f"call_{codebuddy_id[8:]}"
         return codebuddy_id
     
     @staticmethod
     def convert_sse_chunk_to_openai_format(chunk_data: Dict[str, Any], tool_call_index_map: Dict[str, int]) -> Dict[str, Any]:
-        """将CodeBuddy SSE块转换为OpenAI格式"""
+        """Convert a CodeBuddy SSE chunk to OpenAI format"""
         if not chunk_data.get('choices'):
             return chunk_data
         
@@ -154,38 +170,38 @@ class OpenAICompatibilityConverter:
         if not tool_calls:
             return chunk_data
         
-        # 转换工具调用格式
+        # Convert tool call format
         converted_tool_calls = []
         for tc in tool_calls:
             converted_tc = tc.copy()
-            
-            # 转换ID格式
+
+            # Convert ID format
             if tc.get('id'):
                 original_id = tc['id']
                 converted_id = OpenAICompatibilityConverter.convert_tool_call_id(original_id)
                 converted_tc['id'] = converted_id
-                
-                # 分配新的index
+
+                # Assign a new index
                 if original_id not in tool_call_index_map:
                     tool_call_index_map[original_id] = len(tool_call_index_map)
-                
+
                 converted_tc['index'] = tool_call_index_map[original_id]
-            
-            # 如果没有ID，使用当前最新的index
+
+            # If there is no ID, use the current latest index
             elif tool_call_index_map:
-                # 使用最后一个工具调用的index
+                # Use the index of the last tool call
                 converted_tc['index'] = max(tool_call_index_map.values())
-            
+
             converted_tool_calls.append(converted_tc)
-        
-        # 更新chunk数据
+
+        # Update chunk data
         converted_chunk = chunk_data.copy()
         converted_chunk['choices'][0]['delta']['tool_calls'] = converted_tool_calls
         
         return converted_chunk
 
 def parse_sse_line(line: str) -> Optional[Dict[str, Any]]:
-    """解析单行SSE数据"""
+    """Parse a single line of SSE data"""
     if not line.startswith('data: '):
         return None
     
@@ -199,15 +215,15 @@ def parse_sse_line(line: str) -> Optional[Dict[str, Any]]:
         return None
 
 def validate_and_fix_tool_call_args(args: str) -> str:
-    """增强版的工具调用参数验证和修复 - 专门处理多工具调用问题"""
+    """Enhanced validation and repair of tool call arguments - specifically handles multi-tool-call issues"""
     if not args:
         return '{}'
     
     args = args.strip()
     
-    # 检查是否是多个JSON对象连接的情况 - 这是多工具调用的主要问题
+    # Check whether multiple JSON objects are concatenated - this is the main multi-tool-call problem
     if args.count('}{') > 0:
-        # 尝试分离多个JSON对象
+        # Try to separate the multiple JSON objects
         json_objects = []
         current_obj = ""
         brace_count = 0
@@ -219,7 +235,7 @@ def validate_and_fix_tool_call_args(args: str) -> str:
             elif char == '}':
                 brace_count -= 1
                 if brace_count == 0 and current_obj.strip():
-                    # 完成了一个JSON对象
+                    # Completed one JSON object
                     try:
                         parsed = json.loads(current_obj.strip())
                         json_objects.append(parsed)
@@ -230,14 +246,14 @@ def validate_and_fix_tool_call_args(args: str) -> str:
         if json_objects:
             return json.dumps(json_objects[0], ensure_ascii=False)
     
-    # 原有的修复逻辑
+    # Original repair logic
     try:
         json.loads(args)
         return args
     except json.JSONDecodeError as e:
-        
-        
-        # 尝试修复常见的JSON问题
+
+
+        # Try to fix common JSON problems
         original_args = args
         if not args.endswith('}') and args.count('{') > args.count('}'):
             args += '}'
@@ -254,38 +270,38 @@ def validate_and_fix_tool_call_args(args: str) -> str:
             return '{}'
 
 class SSEConnectionManager:
-    """SSE 连接管理器，包含重连逻辑"""
+    """SSE connection manager, including reconnection logic"""
     
     def __init__(self, max_retries: int = 3, retry_delay: float = 1.0):
         self.max_retries = max_retries
         self.retry_delay = retry_delay
     
     async def stream_with_retry(self, stream_func, *args, **kwargs):
-        """带重连的流式处理"""
+        """Streaming processing with reconnection"""
         for attempt in range(self.max_retries + 1):
             try:
                 async for chunk in stream_func(*args, **kwargs):
                     yield chunk
-                break  # 成功完成，退出重试循环
+                break  # Completed successfully, exit the retry loop
             except (httpx.TimeoutException, httpx.NetworkError) as e:
                 if attempt < self.max_retries:
-                    wait_time = self.retry_delay * (2 ** attempt)  # 指数退避: 1s, 2s, 4s
-                    logger.warning(f"连接失败，{wait_time}秒后重试 (第{attempt + 1}次): {e}")
+                    wait_time = self.retry_delay * (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                    logger.warning(f"Connection failed, retrying in {wait_time}s (attempt {attempt + 1}): {e}")
                     yield format_sse_error(f"Connection lost, retrying in {wait_time}s... (attempt {attempt + 1})", "connection_retry")
                     await asyncio.sleep(wait_time)
                     continue
                 else:
-                    logger.error(f"重连失败，已达到最大重试次数: {e}")
+                    logger.error(f"Reconnection failed, maximum retry count reached: {e}")
                     yield format_sse_error(f"Connection failed after {self.max_retries} retries: {str(e)}", "connection_failed")
                     raise
             except Exception as e:
-                # 其他异常不重试，直接抛出
-                logger.error(f"流式处理异常: {e}")
+                # Other exceptions are not retried; re-raise directly
+                logger.error(f"Streaming processing exception: {e}")
                 yield format_sse_error(f"Stream error: {str(e)}", "stream_error")
                 raise
 
 class StreamResponseAggregator:
-    """流式响应聚合器 - 修复多工具调用问题：使用工具调用ID作为键"""
+    """Streaming response aggregator - fixes multi-tool-call issues by using the tool call ID as the key"""
     
     def __init__(self):
         self.data = {
@@ -297,14 +313,14 @@ class StreamResponseAggregator:
             "usage": None,
             "system_fingerprint": None
         }
-        # 🔑 关键：使用工具调用ID作为键，因为index都是0会覆盖
+        # 🔑 Key point: use the tool call ID as the key, because the index is always 0 and would overwrite
         self.tool_call_map = {}  # key: tool_call_id, value: tool_call_data
-        self.tool_call_order = []  # 保持工具调用的接收顺序
-        self.current_tool_id = None  # 当前正在处理的工具调用ID
-    
+        self.tool_call_order = []  # Preserve the order in which tool calls are received
+        self.current_tool_id = None  # ID of the tool call currently being processed
+
     def process_chunk(self, obj: Dict[str, Any]):
-        """处理单个响应块"""
-        # 聚合基本信息
+        """Process a single response chunk"""
+        # Aggregate basic information
         self.data["id"] = self.data["id"] or obj.get('id')
         self.data["model"] = self.data["model"] or obj.get('model')
         self.data["system_fingerprint"] = obj.get('system_fingerprint') or self.data["system_fingerprint"]
@@ -322,22 +338,22 @@ class StreamResponseAggregator:
         
         delta = choice.get('delta', {})
         
-        # 聚合内容
+        # Aggregate content
         if delta.get('content'):
             self.data["content"] += delta.get('content')
-        
-        # 处理工具调用
+
+        # Handle tool calls
         if delta.get('tool_calls'):
             self._process_tool_calls(delta.get('tool_calls'))
-    
+
     def _process_tool_calls(self, tool_calls: List[Dict[str, Any]]):
-        """处理工具调用 - 修复版：使用工具调用ID，正确处理分块传输"""
+        """Handle tool calls - fixed version: use the tool call ID and correctly handle chunked transfer"""
         for tc in tool_calls:
             tool_id = tc.get('id')
-            
-            # 如果有ID，这是一个新的工具调用
+
+            # If there is an ID, this is a new tool call
             if tool_id:
-                # 新工具调用
+                # New tool call
                 if tool_id not in self.tool_call_map:
                     self.tool_call_map[tool_id] = {
                         'id': tool_id,
@@ -349,12 +365,12 @@ class StreamResponseAggregator:
                     }
                     self.tool_call_order.append(tool_id)
                     self.current_tool_id = tool_id
-                    logger.info(f"🔧 新工具调用: {tool_id}")
+                    logger.info(f"🔧 New tool call: {tool_id}")
                 else:
-                    # 更新当前工具调用ID
+                    # Update the current tool call ID
                     self.current_tool_id = tool_id
-                
-                # 更新工具调用信息
+
+                # Update tool call information
                 if tc.get('type'):
                     self.tool_call_map[tool_id]['type'] = tc.get('type')
                 
@@ -364,7 +380,7 @@ class StreamResponseAggregator:
                 if func.get('arguments'):
                     self.tool_call_map[tool_id]['function']['arguments'] += func.get('arguments')
             
-            # 如果没有ID，但有当前工具调用ID，这是增量数据
+            # If there is no ID but there is a current tool call ID, this is incremental data
             elif self.current_tool_id and self.current_tool_id in self.tool_call_map:
                 func = tc.get('function', {})
                 if func.get('name'):
@@ -373,27 +389,27 @@ class StreamResponseAggregator:
                     self.tool_call_map[self.current_tool_id]['function']['arguments'] += func.get('arguments')
             
             else:
-                # 没有ID且没有当前工具调用，跳过
-                logger.warning("⚠️ 工具调用缺少ID且无当前工具调用上下文，跳过处理")
-    
+                # No ID and no current tool call, skip
+                logger.warning("⚠️ Tool call is missing an ID and there is no current tool call context, skipping")
+
     def finalize(self) -> Dict[str, Any]:
-        """完成聚合并返回最终响应"""
-        # 按接收顺序构建工具调用列表
+        """Finish aggregation and return the final response"""
+        # Build the tool call list in the order received
         if self.tool_call_map:
             self.data["tool_calls"] = []
             for tool_id in self.tool_call_order:
                 if tool_id in self.tool_call_map:
                     tc = self.tool_call_map[tool_id]
-                    # 验证和修复工具调用参数
+                    # Validate and repair the tool call arguments
                     tc['function']['arguments'] = validate_and_fix_tool_call_args(
                         tc['function']['arguments']
                     )
                     self.data["tool_calls"].append(tc)
-                    logger.info(f"📋 工具调用: {tool_id} - {tc['function']['name']}")
-            
-            logger.info(f"✅ 成功聚合 {len(self.data['tool_calls'])} 个工具调用")
-        
-        # 构建最终响应
+                    logger.info(f"📋 Tool call: {tool_id} - {tc['function']['name']}")
+
+            logger.info(f"✅ Successfully aggregated {len(self.data['tool_calls'])} tool call(s)")
+
+        # Build the final response
         final_message = {"role": "assistant", "content": self.data["content"]}
         if self.data["tool_calls"]:
             final_message["tool_calls"] = self.data["tool_calls"]
@@ -422,106 +438,156 @@ class StreamResponseAggregator:
         
         return final_response
 
+class UpstreamAttemptError(Exception):
+    """Safe error that does not carry the upstream response body."""
+
+    def __init__(self, kind: str, status_code: int, code: str):
+        super().__init__(code)
+        self.kind = kind
+        self.status_code = status_code
+        self.code = code
+
+
 class CodeBuddyStreamService:
-    """CodeBuddy 流式服务类 - 职责分离，使用连接池优化"""
-    
-    def __init__(self):
-        self.connection_manager = SSEConnectionManager(max_retries=3, retry_delay=1.0)
-    
-    def _handle_api_error(self, status_code: int, error_msg: str) -> None:
-        """统一的API错误处理 - 直接抛出异常"""
-        logger.error(f"CodeBuddy API错误: {status_code} - {error_msg}")
-        
+    """CodeBuddy streaming service; each method performs exactly one upstream attempt."""
+
+    @staticmethod
+    def _classify_status(status_code: int) -> UpstreamAttemptError:
         if status_code == 401:
-            raise HTTPException(status_code=401, detail="CodeBuddy API authentication failed")
-        elif status_code == 429:
-            raise HTTPException(status_code=429, detail="CodeBuddy API rate limit exceeded")
-        elif status_code >= 500:
-            raise HTTPException(status_code=502, detail="CodeBuddy API server error")
-        else:
-            raise HTTPException(status_code=status_code, detail=f"CodeBuddy API error: {error_msg}")
-    
-    async def handle_stream_response(self, payload: Dict[str, Any], headers: Dict[str, str]) -> StreamingResponse:
-        """处理流式响应 - 使用OpenAI兼容性转换器修复格式问题"""
-        async def stream_core():
-            client = await get_http_client()
-            async with client.stream("POST", get_codebuddy_api_url(), json=payload, headers=headers) as response:
-                if response.status_code != 200:
-                    error_text = await response.aread()
-                    error_msg = error_text.decode('utf-8', errors='ignore')
-                    yield format_sse_error(f"CodeBuddy API error: {response.status_code} - {error_msg}", "api_error")
-                    return
-                
-                buffer = ""
-                tool_call_index_map = {}  # 用于跟踪工具调用ID到index的映射
-                
-                
-                async for chunk in response.aiter_text(chunk_size=8192):
-                    if not chunk:
+            return UpstreamAttemptError("invalid", 401, "upstream_authentication_failed")
+        if status_code in {403, 429}:
+            return UpstreamAttemptError("cooldown", status_code, "upstream_temporarily_unavailable")
+        if status_code >= 500:
+            return UpstreamAttemptError("transient", status_code, "upstream_server_error")
+        return UpstreamAttemptError("fatal", status_code, "upstream_request_rejected")
+
+    async def open_stream_response(
+        self,
+        payload: Dict[str, Any],
+        headers: Dict[str, str],
+        key_id: Optional[str] = None,
+    ) -> StreamingResponse:
+        """Establish the connection and verify the upstream status before returning a StreamingResponse."""
+        client = await get_http_client()
+        request = client.build_request(
+            "POST", get_codebuddy_api_url(), json=payload, headers=headers
+        )
+        try:
+            response = await client.send(request, stream=True)
+        except httpx.TimeoutException as exc:
+            raise UpstreamAttemptError("transient", 504, "upstream_timeout") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamAttemptError("transient", 502, "upstream_network_error") from exc
+
+        if response.status_code != 200:
+            status_code = response.status_code
+            await response.aclose()
+            raise self._classify_status(status_code)
+
+        # Do not expose upstream response headers; only this proxy's fixed SSE headers
+        # are sent downstream after the first chunk is safely available.
+
+        async def converted_chunks():
+            buffer = ""
+            tool_call_index_map = {}
+            async for chunk in response.aiter_text(chunk_size=8192):
+                if not chunk:
+                    continue
+                buffer += chunk
+
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    if not line.strip() or line.startswith(':'):
                         continue
-                    
-                    buffer += chunk
-                    
-                    # 处理完整的SSE行
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        
-                        # 跳过空行和注释行
-                        if not line.strip() or line.startswith(':'):
-                            continue
-                        
-                        # 检查是否结束
-                        if '[DONE]' in line:
-                            
-                            yield line + '\n'
-                            return
-                        
-                        # 解析SSE数据
-                        chunk_data = parse_sse_line(line)
-                        if chunk_data:
-                            # 🔑 关键修改：使用OpenAI兼容性转换器
-                            converted_chunk = OpenAICompatibilityConverter.convert_sse_chunk_to_openai_format(
-                                chunk_data, tool_call_index_map
-                            )
-                            
-                            # 重新格式化为SSE格式并发送
-                            converted_line = f"data: {json.dumps(converted_chunk, ensure_ascii=False)}"
-                            yield converted_line + '\n'
-                        else:
-                            # 非数据行直接转发
-                            yield line + '\n'
-                
-                # 处理缓冲区中剩余的数据
-                if buffer.strip():
-                    chunk_data = parse_sse_line(buffer.strip())
+                    if '[DONE]' in line:
+                        yield line + '\n'
+                        return
+
+                    chunk_data = parse_sse_line(line)
                     if chunk_data:
                         converted_chunk = OpenAICompatibilityConverter.convert_sse_chunk_to_openai_format(
                             chunk_data, tool_call_index_map
                         )
-                        converted_line = f"data: {json.dumps(converted_chunk, ensure_ascii=False)}"
-                        yield converted_line + '\n'
-                    else:
-                        yield buffer + '\n'
-        
-        async def stream_with_retry():
-            async for chunk in self.connection_manager.stream_with_retry(stream_core):
-                yield chunk
-        
-        return StreamingResponse(stream_with_retry(), media_type="text/event-stream", headers=SSE_HEADERS)
-    
-    async def handle_non_stream_response(self, payload: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-        """处理非流式响应 - 使用修复后的聚合器，支持多工具调用"""
+                        line = f"data: {json.dumps(converted_chunk, ensure_ascii=False)}"
+                    yield line + '\n'
+
+            if buffer.strip():
+                chunk_data = parse_sse_line(buffer.strip())
+                if chunk_data:
+                    converted_chunk = OpenAICompatibilityConverter.convert_sse_chunk_to_openai_format(
+                        chunk_data, tool_call_index_map
+                    )
+                    buffer = f"data: {json.dumps(converted_chunk, ensure_ascii=False)}"
+                yield buffer + '\n'
+
+        stream = converted_chunks()
+        try:
+            first_chunk = await anext(stream)
+        except StopAsyncIteration:
+            first_chunk = None
+        except httpx.TimeoutException as exc:
+            await response.aclose()
+            raise UpstreamAttemptError("transient", 504, "upstream_timeout") from exc
+        except httpx.RequestError as exc:
+            await response.aclose()
+            raise UpstreamAttemptError("transient", 502, "upstream_network_error") from exc
+        except Exception as exc:
+            await response.aclose()
+            raise UpstreamAttemptError("fatal", 502, "upstream_response_invalid") from exc
+
+        async def stream_core():
+            try:
+                if first_chunk is not None:
+                    yield first_chunk
+                async for chunk in stream:
+                    yield chunk
+            except httpx.RequestError:
+                logger.warning("CodeBuddy upstream stream interrupted")
+                if key_id is not None:
+                    await codebuddy_api_key_manager.mark_transient_error(
+                        key_id, "stream_interrupted"
+                    )
+                yield format_sse_error(
+                    "Upstream stream interrupted", "upstream_stream_error"
+                )
+            except Exception:
+                logger.error("Unexpected CodeBuddy stream processing error")
+                if key_id is not None:
+                    await codebuddy_api_key_manager.mark_transient_error(
+                        key_id, "stream_processing_error"
+                    )
+                yield format_sse_error(
+                    "Upstream stream interrupted", "upstream_stream_error"
+                )
+            finally:
+                await response.aclose()
+
+        return StreamingResponse(
+            stream_core(), media_type="text/event-stream", headers=SSE_HEADERS
+        )
+
+    async def handle_non_stream_response(
+        self, payload: Dict[str, Any], headers: Dict[str, str]
+    ) -> Dict[str, Any]:
+        """Perform a single non-streaming upstream request and aggregate the SSE response."""
         try:
             client = await get_http_client()
-            response = await client.post(get_codebuddy_api_url(), json=payload, headers=headers)
-            
-            if response.status_code != 200:
-                error_msg = response.text
-                self._handle_api_error(response.status_code, error_msg)
-            
+            response = await client.post(
+                get_codebuddy_api_url(), json=payload, headers=headers
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamAttemptError("transient", 504, "upstream_timeout") from exc
+        except httpx.RequestError as exc:
+            raise UpstreamAttemptError("transient", 502, "upstream_network_error") from exc
+
+        if response.status_code != 200:
+            status_code = response.status_code
+            await response.aclose()
+            raise self._classify_status(status_code)
+
+        try:
             aggregator = StreamResponseAggregator()
             buffer = ""
-            
             async for chunk in response.aiter_text():
                 if not chunk:
                     continue
@@ -531,42 +597,35 @@ class CodeBuddyStreamService:
                     obj = parse_sse_line(line)
                     if obj:
                         aggregator.process_chunk(obj)
-            
+
             if buffer.strip():
                 obj = parse_sse_line(buffer.strip())
                 if obj:
                     aggregator.process_chunk(obj)
-            
             return aggregator.finalize()
-            
-        except httpx.TimeoutException:
-            logger.error("CodeBuddy API 超时")
-            raise HTTPException(status_code=504, detail="CodeBuddy API timeout")
-        except httpx.NetworkError as e:
-            logger.error(f"网络错误: {e}")
-            raise HTTPException(status_code=502, detail=f"Network error: {str(e)}")
-        except HTTPException:
+        except httpx.RequestError as exc:
+            raise UpstreamAttemptError("transient", 502, "upstream_network_error") from exc
+        except UpstreamAttemptError:
             raise
-        except Exception as e:
-            logger.error(f"请求异常: {e}")
-            raise HTTPException(status_code=500, detail=f"Request error: {str(e)}")
+        except Exception as exc:
+            raise UpstreamAttemptError("fatal", 502, "upstream_response_invalid") from exc
 
 class RequestProcessor:
-    """请求预处理器 - 线程安全的请求处理"""
-    
+    """Request preprocessor - thread-safe request handling"""
+
     @staticmethod
     def prepare_payload(request_body: Dict[str, Any]) -> Dict[str, Any]:
-        """准备请求载荷"""
+        """Prepare the request payload"""
         payload = request_body.copy()
-        payload["stream"] = True  # CodeBuddy 只支持流式请求
-        
-        # 处理消息长度要求：CodeBuddy要求至少2条消息
+        payload["stream"] = True  # CodeBuddy only supports streaming requests
+
+        # Handle the message count requirement: CodeBuddy requires at least 2 messages
         messages = payload.get("messages", [])
         if len(messages) == 1 and messages[0].get("role") == "user":
             system_msg = {"role": "system", "content": "You are a helpful assistant."}
             payload["messages"] = [system_msg] + messages
         
-        # 应用关键词替换
+        # Apply keyword replacement
         for msg in payload.get("messages", []):
             if msg.get("role") == "system":
                 msg["content"] = apply_keyword_replacement_to_system_message(msg.get("content"))
@@ -575,7 +634,7 @@ class RequestProcessor:
     
     @staticmethod
     def validate_request(request_body: Dict[str, Any]) -> None:
-        """验证请求参数"""
+        """Validate request parameters"""
         if not isinstance(request_body, dict):
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
         
@@ -586,32 +645,104 @@ class RequestProcessor:
         if not messages:
             raise HTTPException(status_code=400, detail="At least one message is required")
         
-        # 验证消息格式
+        # Validate message format
         for i, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 raise HTTPException(status_code=400, detail=f"Message {i} must be an object")
             if "role" not in msg or "content" not in msg:
                 raise HTTPException(status_code=400, detail=f"Message {i} must have 'role' and 'content' fields")
 
+@dataclass(repr=False)
+class ResolvedCredential:
+    """Unified upstream credential; the raw token must not be logged or serialized."""
+
+    bearer_token: str
+    user_id: Optional[str]
+    source: str
+    key_id: Optional[str] = None
+
+
 class CredentialManager:
-    """凭证管理器 - 线程安全的凭证获取"""
-    
+    """Resolve legacy credentials or TXT API keys according to the auth mode."""
+
     @staticmethod
-    def get_valid_credential() -> Dict[str, Any]:
-        """获取有效凭证，包含错误处理"""
+    def get_legacy_credential() -> Optional[ResolvedCredential]:
         try:
             credential = codebuddy_token_manager.get_next_credential()
-            if not credential:
-                raise HTTPException(status_code=401, detail="没有可用的CodeBuddy凭证")
-            
-            bearer_token = credential.get('bearer_token')
-            if not bearer_token:
-                raise HTTPException(status_code=401, detail="无效的CodeBuddy凭证")
-            
-            return credential
-        except Exception as e:
-            logger.error(f"获取凭证失败: {e}")
-            raise HTTPException(status_code=401, detail="凭证获取失败")
+        except Exception:
+            logger.exception("Failed to select a legacy CodeBuddy credential")
+            return None
+        if not credential or not credential.get("bearer_token"):
+            return None
+        return ResolvedCredential(
+            bearer_token=credential["bearer_token"],
+            user_id=credential.get("user_id"),
+            source="credentials",
+        )
+
+    @staticmethod
+    async def get_api_key(excluded_ids: Set[str]) -> Optional[ResolvedCredential]:
+        selection = await codebuddy_api_key_manager.acquire(excluded_ids)
+        if selection is None:
+            return None
+        return ResolvedCredential(
+            bearer_token=selection.key,
+            user_id=None,
+            source="api_key_file",
+            key_id=selection.key_id,
+        )
+
+    @staticmethod
+    async def resolve_source() -> tuple[str, int]:
+        from config import get_codebuddy_auth_mode
+
+        mode = get_codebuddy_auth_mode()
+        if mode == "credentials":
+            return "credentials", 1
+
+        eligible = await codebuddy_api_key_manager.eligible_count()
+        if eligible > 0:
+            return "api_key_file", eligible
+        if mode == "auto":
+            return "credentials", 1
+
+        total = await codebuddy_api_key_manager.total_count()
+        if total == 0:
+            raise ApiKeyConfigurationError(
+                "No API keys are configured in CODEBUDDY_API_KEYS_FILE"
+            )
+        raise ApiKeyConfigurationError("No API keys are currently available")
+
+
+def openai_error_response(
+    message: str, error_type: str, code: str, status_code: int
+) -> JSONResponse:
+    """Construct an OpenAI-compatible error that excludes sensitive upstream information."""
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": code,
+            }
+        },
+    )
+
+
+async def record_attempt_error(credential: ResolvedCredential, error: UpstreamAttemptError) -> None:
+    if credential.source != "api_key_file" or credential.key_id is None:
+        return
+    if error.kind == "invalid":
+        await codebuddy_api_key_manager.mark_invalid(credential.key_id)
+    elif error.kind == "cooldown":
+        await codebuddy_api_key_manager.mark_cooldown(
+            credential.key_id, error.status_code
+        )
+    else:
+        await codebuddy_api_key_manager.mark_transient_error(
+            credential.key_id, error.code
+        )
 
 # --- API Endpoints ---
 
@@ -622,55 +753,161 @@ async def chat_completions(
     x_conversation_request_id: Optional[str] = Header(None, alias="X-Conversation-Request-ID"),
     x_conversation_message_id: Optional[str] = Header(None, alias="X-Conversation-Message-ID"),
     x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
-    _token: str = Depends(authenticate)
+    auth_context: ClientAuthContext = Depends(authenticate_inference)
 ):
-    """CodeBuddy V1 聊天完成API - 重构后的简洁版本"""
+    """CodeBuddy V1 chat completions API, supporting relay and per-request passthrough."""
     try:
-        # 解析和验证请求体
-        try:
-            request_body = await request.json()
-        except Exception as e:
-            logger.error(f"解析请求体失败: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {str(e)}")
-        
-        # 验证请求参数
+        request_body = await request.json()
+    except Exception:
+        return openai_error_response(
+            "Invalid JSON request body", "invalid_request_error", "invalid_json", 400
+        )
+
+    try:
         RequestProcessor.validate_request(request_body)
-        
-        # 获取有效凭证
-        credential = CredentialManager.get_valid_credential()
-        
-        # 生成请求头
+    except HTTPException as exc:
+        return openai_error_response(
+            str(exc.detail), "invalid_request_error", "invalid_request", exc.status_code
+        )
+
+    passthrough_credential: Optional[ResolvedCredential] = None
+    if auth_context.mode == "passthrough":
+        if not auth_context.passthrough_key:
+            return openai_error_response(
+                "A Bearer API key is required",
+                "authentication_error",
+                "missing_api_key",
+                401,
+            )
+        source, max_attempts = "passthrough", 1
+        passthrough_credential = ResolvedCredential(
+            bearer_token=auth_context.passthrough_key,
+            user_id=None,
+            source="passthrough",
+        )
+    else:
+        try:
+            source, max_attempts = await CredentialManager.resolve_source()
+        except (ApiKeyConfigurationError, ValueError):
+            logger.error("CodeBuddy API key file authentication is not configured correctly")
+            return openai_error_response(
+                "Upstream API key file is empty, unavailable, or invalid",
+                "configuration_error",
+                "api_key_file_unavailable",
+                503,
+            )
+
+    payload = RequestProcessor.prepare_payload(request_body)
+    usage_stats_manager.record_model_usage(payload.get("model", "unknown"))
+    service = CodeBuddyStreamService()
+    client_wants_stream = request_body.get("stream", False)
+    excluded_ids: Set[str] = set()
+    last_error: Optional[UpstreamAttemptError] = None
+
+    for _attempt in range(max_attempts):
+        if source == "passthrough":
+            credential = passthrough_credential
+        elif source == "api_key_file":
+            credential = await CredentialManager.get_api_key(excluded_ids)
+        else:
+            credential = CredentialManager.get_legacy_credential()
+
+        if credential is None:
+            break
+        if credential.key_id is not None:
+            excluded_ids.add(credential.key_id)
+
+        try:
+            upstream_key_header = get_upstream_api_key_header()
+        except ValueError:
+            return openai_error_response(
+                "Upstream API key header mode is misconfigured",
+                "configuration_error",
+                "upstream_header_mode_invalid",
+                500,
+            )
+
         headers = codebuddy_api_client.generate_codebuddy_headers(
-            bearer_token=credential.get('bearer_token'),
-            user_id=credential.get('user_id'),
+            bearer_token=credential.bearer_token,
+            user_id=credential.user_id,
             conversation_id=x_conversation_id,
             conversation_request_id=x_conversation_request_id,
             conversation_message_id=x_conversation_message_id,
-            request_id=x_request_id
+            request_id=x_request_id,
+            api_key_header=upstream_key_header,
         )
-        
-        # 预处理请求
-        payload = RequestProcessor.prepare_payload(request_body)
-        usage_stats_manager.record_model_usage(payload.get("model", "unknown"))
-        
-        # 使用服务类处理请求
-        service = CodeBuddyStreamService()
-        client_wants_stream = request_body.get("stream", False)
-        
-        if client_wants_stream:
-            return await service.handle_stream_response(payload, headers)
-        else:
-            return await service.handle_non_stream_response(payload, headers)
-                
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"CodeBuddy V1 API错误: {e}")
-        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+        try:
+            if client_wants_stream:
+                result = await service.open_stream_response(
+                    payload, headers, credential.key_id
+                )
+            else:
+                result = await service.handle_non_stream_response(payload, headers)
+            if credential.key_id is not None:
+                await codebuddy_api_key_manager.mark_success(credential.key_id)
+            return result
+        except UpstreamAttemptError as error:
+            last_error = error
+            await record_attempt_error(credential, error)
+            logger.warning(
+                "CodeBuddy upstream attempt failed: source=%s code=%s",
+                credential.source,
+                error.code,
+            )
+            if source != "api_key_file" or error.kind == "fatal":
+                break
+
+    if source == "credentials" and last_error is None:
+        return openai_error_response(
+            "No valid CodeBuddy credentials are available",
+            "authentication_error",
+            "credentials_unavailable",
+            401,
+        )
+
+    if source == "passthrough" and last_error is not None:
+        if last_error.status_code == 401:
+            return openai_error_response(
+                "Upstream CodeBuddy rejected the supplied API key",
+                "authentication_error",
+                "upstream_api_key_rejected",
+                401,
+            )
+        error_type = (
+            "rate_limit_error"
+            if last_error.status_code == 429
+            else "permission_error"
+            if last_error.status_code == 403
+            else "upstream_error"
+        )
+        return openai_error_response(
+            "Upstream CodeBuddy request failed",
+            error_type,
+            last_error.code,
+            last_error.status_code,
+        )
+
+    status_code = (
+        502
+        if source == "credentials" and last_error and last_error.status_code >= 500
+        else last_error.status_code
+        if source == "credentials" and last_error
+        else 502
+    )
+    code = last_error.code if source == "credentials" and last_error else "upstream_keys_exhausted"
+    return openai_error_response(
+        "Upstream CodeBuddy request failed",
+        "upstream_error",
+        code,
+        status_code,
+    )
 
 @router.get("/v1/models")
-async def list_v1_models(_token: str = Depends(authenticate)):
-    """获取CodeBuddy V1模型列表"""
+async def list_v1_models(
+    _auth_context: ClientAuthContext = Depends(authenticate_inference),
+):
+    """Get the list of CodeBuddy V1 models"""
     try:
         return {
             "object": "list",
@@ -683,12 +920,28 @@ async def list_v1_models(_token: str = Depends(authenticate)):
         }
         
     except Exception as e:
-        logger.error(f"获取V1模型列表错误: {e}")
-        raise HTTPException(status_code=500, detail="获取模型列表失败")
+        logger.error(f"Error getting V1 model list: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get model list")
+
+@router.get("/v1/api-keys/status", summary="Get upstream API key pool status")
+async def get_api_keys_status(_token: str = Depends(authenticate_admin)):
+    """Return a safe status containing only masked keys and runtime statistics."""
+    from config import get_codebuddy_auth_mode
+
+    status = await codebuddy_api_key_manager.get_status()
+    return {"auth_mode": get_codebuddy_auth_mode(), **status}
+
+
+@router.post("/v1/api-keys/reload", summary="Reload upstream API keys")
+async def reload_api_keys(_token: str = Depends(authenticate_admin)):
+    """Force a re-read of the TXT API key file without restarting the service."""
+    result = await codebuddy_api_key_manager.reload()
+    return {"message": "API key file reloaded", **result}
+
 
 @router.get("/v1/credentials", summary="List all available credentials")
-async def list_credentials(_token: str = Depends(authenticate)):
-    """列出所有可用凭证的详细信息，包括过期状态"""
+async def list_credentials(_token: str = Depends(authenticate_admin)):
+    """List detailed information for all available credentials, including expiration status"""
     try:
         credentials_info = codebuddy_token_manager.get_credentials_info()
         safe_credentials = []
@@ -698,7 +951,7 @@ async def list_credentials(_token: str = Depends(authenticate)):
         for info in credentials_info:
             bearer_token = credentials[info['index']].get("bearer_token", "") if info['index'] < len(credentials) else ""
             
-            # 格式化时间显示
+            # Format the time display
             if info['time_remaining'] is not None and info['time_remaining'] > 0:
                 days, remainder = divmod(info['time_remaining'], 86400)
                 hours, remainder = divmod(remainder, 3600)
@@ -708,7 +961,7 @@ async def list_credentials(_token: str = Depends(authenticate)):
                 time_remaining_str = "Expired" if info['time_remaining'] is not None else "Unknown"
             
             safe_credentials.append({
-                **info,  # 展开所有原始信息
+                **info,  # Expand all original info
                 "time_remaining_str": time_remaining_str,
                 "has_token": bool(bearer_token),
                 "token_preview": f"{bearer_token[:10]}...{bearer_token[-4:]}" if len(bearer_token) > 14 else "Invalid Token"
@@ -717,16 +970,16 @@ async def list_credentials(_token: str = Depends(authenticate)):
         return {"credentials": safe_credentials}
         
     except Exception as e:
-        logger.error(f"获取凭证列表失败: {e}")
+        logger.error(f"Failed to get credential list: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/v1/credentials", summary="Add a new credential")
 async def add_credential(
     request: Request,
-    _token: str = Depends(authenticate)
+    _token: str = Depends(authenticate_admin)
 ):
-    """添加一个新的认证凭证"""
+    """Add a new authentication credential"""
     try:
         data = await request.json()
         if not data.get("bearer_token"):
@@ -743,16 +996,16 @@ async def add_credential(
         return {"message": "Credential added successfully"}
 
     except Exception as e:
-        logger.error(f"添加凭证失败: {e}")
+        logger.error(f"Failed to add credential: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/v1/credentials/select", summary="Manually select a credential")
 async def select_credential(
     request: Request,
-    _token: str = Depends(authenticate)
+    _token: str = Depends(authenticate_admin)
 ):
-    """手动选择指定的凭证"""
+    """Manually select the specified credential"""
     try:
         data = await request.json()
         index = data.get("index")
@@ -765,25 +1018,25 @@ async def select_credential(
         return {"message": f"Credential #{index + 1} selected successfully"}
 
     except Exception as e:
-        logger.error(f"选择凭证失败: {e}")
+        logger.error(f"Failed to select credential: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/v1/credentials/auto", summary="Resume automatic credential rotation")
-async def resume_auto_rotation(_token: str = Depends(authenticate)):
-    """恢复自动凭证轮换"""
+async def resume_auto_rotation(_token: str = Depends(authenticate_admin)):
+    """Resume automatic credential rotation"""
     try:
         codebuddy_token_manager.clear_manual_selection()
         return {"message": "Resumed automatic credential rotation"}
 
     except Exception as e:
-        logger.error(f"恢复自动轮换失败: {e}")
+        logger.error(f"Failed to resume automatic rotation: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/v1/credentials/toggle-rotation", summary="Toggle automatic credential rotation")
-async def toggle_auto_rotation(_token: str = Depends(authenticate)):
-    """切换自动轮换开关"""
+async def toggle_auto_rotation(_token: str = Depends(authenticate_admin)):
+    """Toggle the automatic rotation switch"""
     try:
         is_enabled = codebuddy_token_manager.toggle_auto_rotation()
         status = "enabled" if is_enabled else "disabled"
@@ -794,25 +1047,25 @@ async def toggle_auto_rotation(_token: str = Depends(authenticate)):
         }
 
     except Exception as e:
-        logger.error(f"切换自动轮换失败: {e}")
+        logger.error(f"Failed to toggle automatic rotation: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/v1/credentials/current", summary="Get current credential info")
-async def get_current_credential(_token: str = Depends(authenticate)):
-    """获取当前使用的凭证信息"""
+async def get_current_credential(_token: str = Depends(authenticate_admin)):
+    """Get information about the currently used credential"""
     try:
         info = codebuddy_token_manager.get_current_credential_info()
         return info
 
     except Exception as e:
-        logger.error(f"获取当前凭证信息失败: {e}")
+        logger.error(f"Failed to get current credential info: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/v1/credentials/delete", summary="Delete a credential by index")
-async def delete_credential(request: Request, _token: str = Depends(authenticate)):
-    """删除一个凭证文件（通过索引）并从列表中移除"""
+async def delete_credential(request: Request, _token: str = Depends(authenticate_admin)):
+    """Delete a credential file (by index) and remove it from the list"""
     try:
         data = await request.json()
         index = data.get("index")
@@ -827,5 +1080,5 @@ async def delete_credential(request: Request, _token: str = Depends(authenticate
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"删除凭证失败: {e}")
+        logger.error(f"Failed to delete credential: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -2,23 +2,26 @@ version: '3.8'
 
 services:
   codebuddy2api:
-    # 使用当前目录下的 Dockerfile 进行构建
+    # Build with the Dockerfile in this directory.
     build: .
-    # 为构建的镜像命名
+    # Tag the built image.
     image: xueyue052/codebuddy2api:latest
-    # 容器的重启策略
+    # Restart the container unless it was explicitly stopped.
     restart: unless-stopped
-    # 将容器的 8001 端口映射到宿主机的 8001 端口
+    # Map the configured host port to container port 8001.
     ports:
-      - "8001:8001"
-    # 数据卷挂载，用于持久化配置和凭证
+      - "${CODEBUDDY_PORT:-8001}:8001"
+    # Persist configuration and credentials on the host.
     volumes:
-      # 将本地的 config.json 文件挂载到容器内，实现配置持久化
-      # 注意：在首次运行前，请确保本地存在一个空的 config.json 文件
-      # 注意：现在挂载的是整个config目录
+      # Mount the complete configuration directory.
       - ./config:/app/config
-      # 将本地的凭证目录挂载到容器内，实现凭证持久化
+      # Mount the legacy credential directory.
       - ./.codebuddy_creds:/app/.codebuddy_creds
-    # 加载 .env 文件中的环境变量
+    # Load application environment variables.
     env_file:
-      - .env
+      - ${CODEBUDDY_ENV_FILE:-.env}
+    # Expose deployment modes explicitly while allowing .env overrides.
+    environment:
+      CODEBUDDY_CLIENT_AUTH_MODE: ${CODEBUDDY_CLIENT_AUTH_MODE:-relay}
+      CODEBUDDY_ADMIN_PASSWORD: ${CODEBUDDY_ADMIN_PASSWORD:-}
+      CODEBUDDY_UPSTREAM_API_KEY_HEADER: ${CODEBUDDY_UPSTREAM_API_KEY_HEADER:-bearer}

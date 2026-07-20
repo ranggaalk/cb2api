@@ -52,7 +52,7 @@ class ModelList(BaseModel):
 
 
 class CredentialInfo(BaseModel):
-    """凭证信息"""
+    """Credential information."""
     index: int
     user_id: str
     created_at: int

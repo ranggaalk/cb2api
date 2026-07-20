@@ -137,6 +137,9 @@ dmypy.json
 # Or, if you have an example file, you can explicitly un-ignore it like this:
 # !.codebuddy_creds/credential.example.json
 
+# Never commit upstream API keys. The example file remains tracked.
+config/codebuddy_api_keys.txt
+
 # IDE files
 .vscode/
 .idea/

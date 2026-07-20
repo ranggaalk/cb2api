@@ -1,0 +1,5 @@
+# Satu upstream CodeBuddy API key per baris.
+# Baris kosong dan baris yang diawali # akan diabaikan.
+
+api_key_example_account_1
+api_key_example_account_2

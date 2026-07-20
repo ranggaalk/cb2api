@@ -34,6 +34,9 @@ Thumbs.db
 *.env.*
 !.env.example
 
+# Upstream API keys are provided through the config volume
+config/codebuddy_api_keys.txt
+
 # Log files
 *.log
 logs/

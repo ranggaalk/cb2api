@@ -1,6 +1,6 @@
 """
-关键词替换工具模块 - 统一处理关键词替换逻辑
-防止CodeBuddy检测到竞争对手关键词
+Keyword replacement utility with centralized replacement rules.
+Prevents CodeBuddy from detecting competitor-related keywords.
 """
 import logging
 
@@ -9,18 +9,18 @@ logger = logging.getLogger(__name__)
 
 def apply_keyword_replacement(text: str) -> str:
     """
-    统一的关键词替换函数
+    Apply the standard keyword replacements.
 
     Args:
-        text: 需要处理的文本内容
+        text: Text content to process.
 
     Returns:
-        str: 替换后的文本内容
+        str: The processed text.
     """
     if not isinstance(text, str):
         return text
 
-    # 定义替换规则
+    # Define replacement rules.
     replacements = {
         "Claude Code": "CodeBuddy Code",
         "Anthropic's official CLI for Claude": "Tencent's official CLI for CodeBuddy",
@@ -31,11 +31,11 @@ def apply_keyword_replacement(text: str) -> str:
 
     original_text = text
 
-    # 应用所有替换规则
+    # Apply every replacement rule.
     for old_keyword, new_keyword in replacements.items():
         text = text.replace(old_keyword, new_keyword)
 
-    # 记录替换日志（仅在调试模式下）
+    # Record replacements at debug level only.
     if text != original_text:
         logger.debug(f"[KEYWORD_REPLACE] Applied keyword replacements, original length: {len(original_text)}, new length: {len(text)}")
 
@@ -44,19 +44,19 @@ def apply_keyword_replacement(text: str) -> str:
 
 def apply_keyword_replacement_to_system_message(content) -> str:
     """
-    专门用于处理系统消息的关键词替换
-    支持字符串和复杂结构的content
+    Apply keyword replacements to system messages.
+    Supports both strings and structured content.
 
     Args:
-        content: 消息内容，可能是字符串或列表结构
+        content: Message content, either a string or a list structure.
 
     Returns:
-        str: 处理后的内容
+        str: The processed content.
     """
     if isinstance(content, str):
         return apply_keyword_replacement(content)
     elif isinstance(content, list):
-        # 处理复杂结构的系统消息
+        # Process structured system-message content.
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
                 item["text"] = apply_keyword_replacement(item.get("text", ""))

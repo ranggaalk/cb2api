@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 _config_cache: Dict[str, Any] = {}
 _CONFIG_JSON_PATH = 'config/config.json'  # Use a path inside a directory
 
+_MASKED_SECRET_SENTINEL = "********"
+_SECRET_CONFIG_KEYS = {"CODEBUDDY_PASSWORD", "CODEBUDDY_ADMIN_PASSWORD"}
+
 _DEFAULT_CONFIG = {
     "CODEBUDDY_HOST": "127.0.0.1",
     "CODEBUDDY_PORT": 8001,
@@ -27,7 +30,15 @@ _DEFAULT_CONFIG = {
     "CODEBUDDY_CREDS_DIR": ".codebuddy_creds",
     "CODEBUDDY_LOG_LEVEL": "INFO",
     "CODEBUDDY_MODELS": "claude-4.0,claude-3.7,gpt-5,gpt-5-mini,gpt-5-nano,o4-mini,gemini-2.5-flash,gemini-2.5-pro,auto-chat",
-    "CODEBUDDY_ROTATION_COUNT": 1
+    "CODEBUDDY_ROTATION_COUNT": 1,
+    "CODEBUDDY_AUTH_MODE": "auto",
+    "CODEBUDDY_API_KEYS_FILE": "./config/codebuddy_api_keys.txt",
+    "CODEBUDDY_API_KEY_ROTATION": "round_robin",
+    "CODEBUDDY_API_KEY_RELOAD_INTERVAL": 5,
+    "CODEBUDDY_API_KEY_COOLDOWN_SECONDS": 300,
+    "CODEBUDDY_CLIENT_AUTH_MODE": "relay",
+    "CODEBUDDY_ADMIN_PASSWORD": None,
+    "CODEBUDDY_UPSTREAM_API_KEY_HEADER": "bearer"
 }
 
 # --- Core Functions ---
@@ -104,7 +115,11 @@ def save_config_to_json():
 # --- Public Getter Functions ---
 
 def get_active_config() -> Dict[str, Any]:
-    return {key: _config_cache.get(key) for key in _DEFAULT_CONFIG}
+    config = {key: _config_cache.get(key) for key in _DEFAULT_CONFIG}
+    for key in _SECRET_CONFIG_KEYS:
+        if config.get(key):
+            config[key] = _MASKED_SECRET_SENTINEL
+    return config
 
 def get_server_host() -> str:
     return str(_get_config_value("CODEBUDDY_HOST"))
@@ -114,6 +129,28 @@ def get_server_port() -> int:
 
 def get_server_password() -> Optional[str]:
     return _get_config_value("CODEBUDDY_PASSWORD")
+
+
+def get_admin_password() -> Optional[str]:
+    return _get_config_value("CODEBUDDY_ADMIN_PASSWORD") or get_server_password()
+
+
+def get_client_auth_mode() -> str:
+    mode = str(_get_config_value("CODEBUDDY_CLIENT_AUTH_MODE")).strip().lower()
+    if mode not in {"relay", "passthrough", "hybrid"}:
+        raise ValueError(
+            "CODEBUDDY_CLIENT_AUTH_MODE must be relay, passthrough, or hybrid"
+        )
+    return mode
+
+
+def get_upstream_api_key_header() -> str:
+    mode = str(_get_config_value("CODEBUDDY_UPSTREAM_API_KEY_HEADER")).strip().lower()
+    if mode not in {"x-api-key", "bearer", "both"}:
+        raise ValueError(
+            "CODEBUDDY_UPSTREAM_API_KEY_HEADER must be x-api-key, bearer, or both"
+        )
+    return mode
 
 def get_codebuddy_api_endpoint() -> str:
     return str(_get_config_value("CODEBUDDY_API_ENDPOINT"))
@@ -131,15 +168,52 @@ def get_available_models() -> list:
 def get_rotation_count() -> int:
     return int(_get_config_value("CODEBUDDY_ROTATION_COUNT"))
 
+
+def get_codebuddy_auth_mode() -> str:
+    mode = str(_get_config_value("CODEBUDDY_AUTH_MODE")).strip().lower()
+    if mode not in {"auto", "api_key_file", "credentials"}:
+        raise ValueError("CODEBUDDY_AUTH_MODE must be auto, api_key_file, or credentials")
+    return mode
+
+
+def get_codebuddy_api_keys_file() -> str:
+    return str(_get_config_value("CODEBUDDY_API_KEYS_FILE")).strip()
+
+
+def get_codebuddy_api_key_rotation() -> str:
+    rotation = str(_get_config_value("CODEBUDDY_API_KEY_ROTATION")).strip().lower()
+    if rotation != "round_robin":
+        raise ValueError("CODEBUDDY_API_KEY_ROTATION must be round_robin")
+    return rotation
+
+
+def get_codebuddy_api_key_reload_interval() -> int:
+    interval = int(_get_config_value("CODEBUDDY_API_KEY_RELOAD_INTERVAL"))
+    if interval < 0:
+        raise ValueError("CODEBUDDY_API_KEY_RELOAD_INTERVAL must be zero or greater")
+    return interval
+
+
+def get_codebuddy_api_key_cooldown_seconds() -> int:
+    cooldown = int(_get_config_value("CODEBUDDY_API_KEY_COOLDOWN_SECONDS"))
+    if cooldown < 0:
+        raise ValueError("CODEBUDDY_API_KEY_COOLDOWN_SECONDS must be zero or greater")
+    return cooldown
+
 # --- Public Setter for Hot-Reload ---
 
 def update_settings(new_settings: Dict[str, Any]):
     """Updates the live config and persists it to config.json."""
     for key, value in new_settings.items():
         if key in _config_cache:
-            original_type = type(_DEFAULT_CONFIG.get(key, value))
+            if key in _SECRET_CONFIG_KEYS and value == _MASKED_SECRET_SENTINEL:
+                continue
+            default_value = _DEFAULT_CONFIG.get(key, value)
+            original_type = type(default_value)
             try:
-                if original_type is bool:
+                if default_value is None:
+                    typed_value = value or None
+                elif original_type is bool:
                     typed_value = str(value).lower() in ('true', '1', 't', 'y', 'yes')
                 else:
                     typed_value = original_type(value)
