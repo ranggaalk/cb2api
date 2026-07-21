@@ -370,6 +370,27 @@ class CodeBuddyAdapterV2:
             max_system_prompt_length=settings.max_system_prompt_length,
         )
 
+        # 2b) CodeBuddy rejects a conversation with fewer than two messages
+        # (a lone user turn returns HTTP 400). Prepend a short default system
+        # message ONLY when there is no system message already and the single
+        # message is a user turn, mirroring the legacy handler. This never
+        # reorders or duplicates existing messages.
+        has_system = any(
+            isinstance(m, dict) and m.get("role") == "system" for m in messages
+        )
+        if (
+            not has_system
+            and len(messages) == 1
+            and isinstance(messages[0], dict)
+            and messages[0].get("role") == "user"
+        ):
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant. Reply in the same language as the user.",
+                }
+            ] + messages
+
         # 3) Keyword replacement on system messages only.
         for msg in messages:
             if isinstance(msg, dict) and msg.get("role") == "system":
