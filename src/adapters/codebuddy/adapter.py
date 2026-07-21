@@ -356,10 +356,17 @@ class CodeBuddyAdapterV2:
         # 1) Convert Anthropic tool blocks → OpenAI shape.
         messages = convert_anthropic_messages_to_openai(raw_messages)
 
-        # 2) Sanitize agent system prompts (system messages only).
+        # 2) Sanitize agent system prompts (system messages only). Per spec §4,
+        # sanitization is AUTO-SKIPPED for agentic/tool requests: when the client
+        # sends tools (Claude Code and other coding agents), the system prompt
+        # carries the tool, permission, and agent-loop instructions the model
+        # needs, and replacing it with a generic prompt both breaks the agent and
+        # is a likely cause of upstream rejection. The config flag only governs
+        # simple web-chat requests that have no tools.
+        has_tools = bool(request_body.get("tools"))
         messages, _sanitized = sanitize_messages(
             messages,
-            enabled=settings.sanitize_agent_prompt,
+            enabled=settings.sanitize_agent_prompt and not has_tools,
             max_system_prompt_length=settings.max_system_prompt_length,
         )
 
