@@ -25,3 +25,12 @@ services:
       CODEBUDDY_CLIENT_AUTH_MODE: ${CODEBUDDY_CLIENT_AUTH_MODE:-relay}
       CODEBUDDY_ADMIN_PASSWORD: ${CODEBUDDY_ADMIN_PASSWORD:-}
       CODEBUDDY_UPSTREAM_API_KEY_HEADER: ${CODEBUDDY_UPSTREAM_API_KEY_HEADER:-bearer}
+    networks:
+      npm_network:
+        aliases:
+          - cb2api
+
+networks:
+  npm_network:
+    external: true
+    name: lizeu_default
