@@ -15,6 +15,7 @@ moderation without weakening legitimate upstream moderation:
    an OpenAI-compatible ``content_filter`` error instead of leaking the
    refusal as an assistant reply.
 """
+import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -106,39 +107,99 @@ class MessageNormalizationError(Exception):
         self.reason = reason
 
 
-def _log_structural(level: int, prefix: str, index: int, msg: Any) -> None:
-    """Log safe structural metadata for a message.
+def _content_block_types(content: Any) -> List[str]:
+    """Return the ``type`` of each block in an array content, else empty list."""
+    if not isinstance(content, list):
+        return []
+    types: List[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            types.append(str(block.get("type", "unknown")))
+        else:
+            types.append(type(block).__name__)
+    return types
 
-    Logs the message index, role, its field-name set, the content field's type,
-    and whether it carries tool_calls / tool_call_id. It never logs message
-    content values or any credential: the field names logged (role, content,
-    tool_calls, ...) are fixed OpenAI-schema identifiers, not user data.
+
+def _collect_tool_ids(msg: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """Return ``(tool_call_ids, tool_result_ids)`` for a message.
+
+    Handles both OpenAI shape (``tool_calls[*].id`` / ``tool_call_id``) and
+    Anthropic array shape (``tool_use`` / ``tool_result`` blocks). IDs are
+    opaque routing tokens (e.g. ``toolu_...`` / ``call_...``), never secrets or
+    content, so logging them is safe and is required for diagnosing lost tool
+    results.
+    """
+    tool_call_ids: List[str] = []
+    tool_result_ids: List[str] = []
+
+    tool_calls = msg.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if isinstance(tc, dict) and tc.get("id"):
+                tool_call_ids.append(str(tc.get("id")))
+
+    if msg.get("tool_call_id"):
+        tool_result_ids.append(str(msg.get("tool_call_id")))
+
+    content = msg.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("id"):
+                tool_call_ids.append(str(block.get("id")))
+            elif block.get("type") == "tool_result" and block.get("tool_use_id"):
+                tool_result_ids.append(str(block.get("tool_use_id")))
+
+    return tool_call_ids, tool_result_ids
+
+
+def _log_structural(level: int, prefix: str, index: int, msg: Any) -> None:
+    """Log safe structural metadata for a single message.
+
+    Emits, per requirement, the fields needed to diagnose lost/malformed
+    tool-use conversion: index, role, content_type, content_block_types,
+    has_tool_calls, tool_call_ids, tool_result_ids, content_length. It never
+    logs message content values, prompts, or credentials: block *types* and
+    opaque tool IDs are structural routing metadata, not user data. content_length
+    is a character count only.
     """
     if isinstance(msg, dict):
         role = msg.get("role")
-        field_names = ",".join(sorted(str(k) for k in msg.keys()))
-        content_type = type(msg.get("content")).__name__
+        content = msg.get("content")
+        content_type = type(content).__name__
+        block_types = _content_block_types(content)
         has_tool_calls = bool(msg.get("tool_calls"))
-        has_tool_call_id = bool(msg.get("tool_call_id"))
+        tool_call_ids, tool_result_ids = _collect_tool_ids(msg)
+        content_length = len(_extract_text(content))
     else:
         role = None
-        field_names = ""
         content_type = type(msg).__name__
+        block_types = []
         has_tool_calls = False
-        has_tool_call_id = False
+        tool_call_ids, tool_result_ids = [], []
+        content_length = 0
 
     logger.log(
         level,
-        "%s index=%d role=%s keys=[%s] content_type=%s has_tool_calls=%s "
-        "has_tool_call_id=%s",
+        "%s index=%d role=%s content_type=%s content_block_types=[%s] "
+        "has_tool_calls=%s tool_call_ids=[%s] tool_result_ids=[%s] content_length=%d",
         prefix,
         index,
         role,
-        field_names,
         content_type,
+        ",".join(block_types),
         has_tool_calls,
-        has_tool_call_id,
+        ",".join(tool_call_ids),
+        ",".join(tool_result_ids),
+        content_length,
     )
+
+
+def log_messages_structural(prefix: str, messages: List[Dict[str, Any]], level: int = logging.DEBUG) -> None:
+    """Log structural diagnostics for an entire message list (content-free)."""
+    for index, msg in enumerate(messages):
+        _log_structural(level, prefix, index, msg)
 
 
 def _infer_role(msg: Dict[str, Any]) -> Any:
@@ -237,6 +298,243 @@ def normalize_messages_for_upstream(
         )
 
     return normalized
+
+
+# Anthropic content-block types that must be converted away before upstream.
+_ANTHROPIC_TOOL_BLOCK_TYPES: Tuple[str, ...] = ("tool_use", "tool_result")
+
+
+def _flatten_tool_result_content(content: Any) -> str:
+    """Flatten an Anthropic ``tool_result.content`` into a complete text string.
+
+    ``tool_result.content`` may be a plain string or a list of blocks
+    (``text``/``image``/...). Every part is preserved so a tool result (e.g. the
+    full text of a file read) is never truncated or dropped. Non-text blocks are
+    serialized to JSON so their information survives rather than being discarded.
+    """
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False))
+            elif isinstance(item, str):
+                parts.append(item)
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content)
+
+
+def _assistant_text_from_blocks(blocks: List[Any]) -> str:
+    """Concatenate the text of the ``text`` blocks in an assistant content array."""
+    parts: List[str] = []
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text", "")))
+    return "".join(parts)
+
+
+def _has_block_type(content: Any, block_type: str) -> bool:
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(b, dict) and b.get("type") == block_type for b in content
+    )
+
+
+def convert_anthropic_messages_to_openai(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Convert Anthropic block-array messages into OpenAI-shaped messages.
+
+    Claude Code sends tool interactions as Anthropic content blocks:
+
+      * an assistant turn whose ``content`` array contains ``tool_use`` blocks
+      * a following user turn whose ``content`` array contains ``tool_result``
+        blocks carrying the tool output (e.g. the full text of a file read)
+
+    CodeBuddy speaks the OpenAI schema, so without conversion these blocks are
+    forwarded verbatim and the tool output never reaches the model — the
+    reported "file contents are not in context" failure. This function rewrites
+    them into the OpenAI shape while preserving every relationship:
+
+      * assistant ``tool_use`` -> ``role: assistant`` message with ``content``
+        (the text blocks, or ``""``) and a ``tool_calls`` list. Each tool call
+        keeps the Anthropic ``tool_use.id`` verbatim and encodes ``input`` as a
+        JSON-string ``function.arguments``.
+      * each user ``tool_result`` -> its own ``role: tool`` message whose
+        ``tool_call_id`` is the verbatim ``tool_use_id`` and whose ``content`` is
+        the complete flattened tool output. Tool results become standalone
+        messages and are never merged into an unrelated user message.
+      * messages whose content is a plain string, or an array with no tool
+        blocks (plain text or multimodal image arrays), are passed through
+        unchanged — array content is never replaced with an empty string.
+
+    The verbatim ID reuse guarantees ``tool_use.id`` == the emitted
+    ``tool_call.id`` == the matching tool message's ``tool_call_id``, so the
+    OpenAI tool-call/tool-result pairing mirrors the Anthropic one exactly. Each
+    block is emitted exactly once, so no tool call or result is duplicated.
+    """
+    converted: List[Dict[str, Any]] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            converted.append(msg)
+            continue
+
+        role = msg.get("role")
+        content = msg.get("content")
+
+        # Non-array content (string / None) and arrays without tool blocks are
+        # preserved verbatim. This keeps plain text, and multimodal image
+        # arrays, exactly as the client sent them.
+        if not isinstance(content, list):
+            converted.append(msg)
+            continue
+
+        has_tool_use = _has_block_type(content, "tool_use")
+        has_tool_result = _has_block_type(content, "tool_result")
+
+        if not has_tool_use and not has_tool_result:
+            # Plain text or multimodal (image) array: preserve as-is.
+            converted.append(msg)
+            continue
+
+        if has_tool_use:
+            # Assistant turn issuing one or more tool calls.
+            tool_calls: List[Dict[str, Any]] = []
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tool_calls.append(
+                    {
+                        "id": block.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name", ""),
+                            # OpenAI arguments must be a JSON *string*.
+                            "arguments": json.dumps(
+                                block.get("input", {}) or {}, ensure_ascii=False
+                            ),
+                        },
+                    }
+                )
+            new_msg = dict(msg)
+            new_msg["role"] = role or "assistant"
+            # Assistant tool-call turns carry text content when present, else "".
+            new_msg["content"] = _assistant_text_from_blocks(content)
+            new_msg["tool_calls"] = tool_calls
+            converted.append(new_msg)
+            continue
+
+        # has_tool_result: split the array so each tool_result becomes its own
+        # tool message; any remaining non-tool blocks become a trailing user
+        # message so tool output is never merged into unrelated user text.
+        leftover_blocks: List[Any] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                converted.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id", ""),
+                        "content": _flatten_tool_result_content(block.get("content")),
+                    }
+                )
+            else:
+                leftover_blocks.append(block)
+
+        if leftover_blocks:
+            # Preserve any accompanying user content (text/image) as a separate
+            # message, keeping array shape so multimodal content survives.
+            converted.append({"role": role or "user", "content": leftover_blocks})
+
+    return converted
+
+
+def validate_upstream_messages(messages: List[Dict[str, Any]]) -> None:
+    """Validate the final OpenAI-shaped messages just before the upstream call.
+
+    Raises :class:`MessageNormalizationError` (carrying the offending message
+    index and a structural description) when any of these hold, so the router
+    can return a local HTTP 400 instead of forwarding a malformed payload:
+
+      * a message is missing ``role`` or ``content``
+      * a ``tool`` message's ``tool_call_id`` has no preceding matching
+        ``tool_calls`` id (an orphaned tool result)
+      * a ``tool_calls`` entry has ``function.arguments`` that is not a valid
+        JSON string
+      * any unconverted Anthropic ``tool_use`` / ``tool_result`` block remains in
+        a message's content array
+    """
+    seen_tool_call_ids: set = set()
+
+    for index, msg in enumerate(messages):
+        _log_structural(logging.DEBUG, "validate upstream message", index, msg)
+
+        if not isinstance(msg, dict):
+            raise MessageNormalizationError(index, "message is not an object")
+
+        role = msg.get("role")
+        if not isinstance(role, str) or not role.strip():
+            raise MessageNormalizationError(index, "message is missing a valid role")
+        if "content" not in msg:
+            raise MessageNormalizationError(index, "message is missing content")
+
+        # No unconverted Anthropic tool blocks may remain in content arrays.
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in _ANTHROPIC_TOOL_BLOCK_TYPES:
+                    raise MessageNormalizationError(
+                        index,
+                        f"unconverted Anthropic '{block.get('type')}' block remains "
+                        f"in content",
+                    )
+
+        # Register tool_call ids and validate their arguments are JSON strings.
+        tool_calls = msg.get("tool_calls")
+        if tool_calls is not None:
+            if not isinstance(tool_calls, list):
+                raise MessageNormalizationError(index, "tool_calls must be a list")
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    raise MessageNormalizationError(index, "tool_call must be an object")
+                tc_id = tc.get("id")
+                if tc_id:
+                    seen_tool_call_ids.add(str(tc_id))
+                func = tc.get("function", {})
+                arguments = func.get("arguments") if isinstance(func, dict) else None
+                if not isinstance(arguments, str):
+                    raise MessageNormalizationError(
+                        index, "tool_call function.arguments must be a JSON string"
+                    )
+                try:
+                    json.loads(arguments)
+                except (ValueError, TypeError):
+                    raise MessageNormalizationError(
+                        index, "tool_call function.arguments is not valid JSON"
+                    )
+
+        # A tool result must reference a tool_call id already seen upstream.
+        if role == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            if not tool_call_id:
+                raise MessageNormalizationError(
+                    index, "tool message is missing tool_call_id"
+                )
+            if str(tool_call_id) not in seen_tool_call_ids:
+                raise MessageNormalizationError(
+                    index,
+                    "tool result references tool_call_id with no preceding "
+                    "matching tool call",
+                )
 
 
 def sanitize_messages(

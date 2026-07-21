@@ -26,9 +26,12 @@ from .usage_stats_manager import usage_stats_manager
 from .keyword_replacer import apply_keyword_replacement_to_system_message
 from .codebuddy_message_sanitizer import (
     MessageNormalizationError,
+    convert_anthropic_messages_to_openai,
     is_codebuddy_moderation_response,
+    log_messages_structural,
     normalize_messages_for_upstream,
     sanitize_messages,
+    validate_upstream_messages,
 )
 from config import (
     get_codebuddy_default_model,
@@ -946,6 +949,19 @@ class RequestProcessor:
 
         messages = source.get("messages", []) or []
 
+        # Requirement: inspect the ORIGINAL request messages (content-free
+        # structural trace) before any transformation.
+        log_messages_structural("original request message", messages)
+
+        # Convert Anthropic content-block messages (tool_use / tool_result
+        # arrays that Claude Code sends) into OpenAI-shaped messages FIRST, so
+        # tool calls become `tool_calls` and tool results become standalone
+        # `role: tool` messages. Without this, tool output (e.g. the full text of
+        # a file read) is forwarded as opaque Anthropic blocks and never reaches
+        # the model, which is the reported tool-result context loss. Plain and
+        # multimodal content arrays are preserved unchanged.
+        messages = convert_anthropic_messages_to_openai(messages)
+
         # Sanitize only agent system prompts that tend to trigger false-positive
         # moderation. User/assistant/tool messages are never modified, and
         # legitimate short system prompts are left intact.
@@ -985,6 +1001,15 @@ class RequestProcessor:
         # MessageNormalizationError (handled by the caller) when a role cannot
         # be determined.
         messages = normalize_messages_for_upstream(messages)
+
+        # Final validation of the exact messages CodeBuddy will receive: every
+        # message has role+content, every tool result references a preceding
+        # matching tool call, function arguments are valid JSON strings, and no
+        # unconverted Anthropic blocks remain. Raises MessageNormalizationError
+        # (handled by the caller as a local HTTP 400 with the message index)
+        # rather than forwarding a malformed payload.
+        log_messages_structural("final upstream message", messages, level=logging.INFO)
+        validate_upstream_messages(messages)
 
         # Build the strict upstream payload. CodeBuddy only supports streaming,
         # so stream is always True upstream; the client's stream preference is
