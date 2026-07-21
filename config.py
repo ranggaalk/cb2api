@@ -44,7 +44,26 @@ _DEFAULT_CONFIG = {
     "CODEBUDDY_MAX_SYSTEM_PROMPT_LENGTH": 2000,
     "CODEBUDDY_MODEL_ALIASES": "",
     "CODEBUDDY_DEFAULT_MODEL": "auto-chat",
-    "CODEBUDDY_UNKNOWN_MODEL_POLICY": "passthrough"
+    "CODEBUDDY_UNKNOWN_MODEL_POLICY": "passthrough",
+    # --- Adapter V2 ---
+    # Which request pipeline handles /v1/chat/completions: "v2" (the isolated
+    # CodeBuddyAdapterV2) or "legacy" (the original monolithic handler).
+    "CODEBUDDY_ADAPTER_VERSION": "v2",
+    # Granular upstream timeouts (seconds). Each stage is distinguished so a
+    # failure can be reported precisely instead of a generic "connect timeout".
+    "CODEBUDDY_CONNECT_TIMEOUT_SECONDS": 30,
+    "CODEBUDDY_POOL_TIMEOUT_SECONDS": 30,
+    "CODEBUDDY_WRITE_TIMEOUT_SECONDS": 60,
+    "CODEBUDDY_HEADERS_TIMEOUT_SECONDS": 300,
+    "CODEBUDDY_FIRST_CHUNK_TIMEOUT_SECONDS": 300,
+    "CODEBUDDY_STREAM_IDLE_TIMEOUT_SECONDS": 600,
+    # Upstream concurrency control.
+    "CODEBUDDY_MAX_CONCURRENT_UPSTREAM_REQUESTS": 20,
+    "CODEBUDDY_UPSTREAM_QUEUE_TIMEOUT_SECONDS": 60,
+    # Large-agentic-request warning thresholds (never used to truncate).
+    "CODEBUDDY_WARN_TOTAL_CONTENT_LENGTH": 50000,
+    "CODEBUDDY_WARN_MESSAGE_COUNT": 40,
+    "CODEBUDDY_WARN_TOOL_COUNT": 30,
 }
 
 # --- Core Functions ---
@@ -208,6 +227,72 @@ def get_codebuddy_model_aliases() -> Dict[str, str]:
         if alias and upstream:
             aliases[alias] = upstream
     return aliases
+
+
+def get_codebuddy_adapter_version() -> str:
+    """Which chat-completions pipeline handles the request.
+
+      * ``v2`` (default): the isolated :class:`CodeBuddyAdapterV2`.
+      * ``legacy``: the original monolithic handler in ``codebuddy_router``.
+
+    An unrecognized value falls back to ``v2`` rather than raising, so a typo
+    never takes the service down; the effective value is logged by the router.
+    """
+    version = str(_get_config_value("CODEBUDDY_ADAPTER_VERSION")).strip().lower()
+    return version if version in {"v2", "legacy"} else "v2"
+
+
+def _get_positive_int(key: str, default: int) -> int:
+    """Return a strictly-positive int config value, else ``default``."""
+    try:
+        value = int(_get_config_value(key))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def get_codebuddy_connect_timeout_seconds() -> float:
+    return float(_get_positive_int("CODEBUDDY_CONNECT_TIMEOUT_SECONDS", 30))
+
+
+def get_codebuddy_pool_timeout_seconds() -> float:
+    return float(_get_positive_int("CODEBUDDY_POOL_TIMEOUT_SECONDS", 30))
+
+
+def get_codebuddy_write_timeout_seconds() -> float:
+    return float(_get_positive_int("CODEBUDDY_WRITE_TIMEOUT_SECONDS", 60))
+
+
+def get_codebuddy_headers_timeout_seconds() -> float:
+    return float(_get_positive_int("CODEBUDDY_HEADERS_TIMEOUT_SECONDS", 300))
+
+
+def get_codebuddy_first_chunk_timeout_seconds() -> float:
+    return float(_get_positive_int("CODEBUDDY_FIRST_CHUNK_TIMEOUT_SECONDS", 300))
+
+
+def get_codebuddy_stream_idle_timeout_seconds() -> float:
+    return float(_get_positive_int("CODEBUDDY_STREAM_IDLE_TIMEOUT_SECONDS", 600))
+
+
+def get_codebuddy_max_concurrent_upstream_requests() -> int:
+    return _get_positive_int("CODEBUDDY_MAX_CONCURRENT_UPSTREAM_REQUESTS", 20)
+
+
+def get_codebuddy_upstream_queue_timeout_seconds() -> float:
+    return float(_get_positive_int("CODEBUDDY_UPSTREAM_QUEUE_TIMEOUT_SECONDS", 60))
+
+
+def get_codebuddy_warn_total_content_length() -> int:
+    return _get_positive_int("CODEBUDDY_WARN_TOTAL_CONTENT_LENGTH", 50000)
+
+
+def get_codebuddy_warn_message_count() -> int:
+    return _get_positive_int("CODEBUDDY_WARN_MESSAGE_COUNT", 40)
+
+
+def get_codebuddy_warn_tool_count() -> int:
+    return _get_positive_int("CODEBUDDY_WARN_TOOL_COUNT", 30)
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:

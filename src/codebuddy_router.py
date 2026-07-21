@@ -34,6 +34,7 @@ from .codebuddy_message_sanitizer import (
     validate_upstream_messages,
 )
 from config import (
+    get_codebuddy_adapter_version,
     get_codebuddy_default_model,
     get_codebuddy_model_aliases,
     get_codebuddy_request_profile,
@@ -131,6 +132,16 @@ class AppLifecycleManager:
             logger.error("Invalid CODEBUDDY_AUTH_MODE configuration")
         if auth_mode in {"auto", "api_key_file"}:
             await codebuddy_api_key_manager.start_periodic_reload()
+
+        # Warm the CodeBuddyAdapterV2 shared HTTP client too, so its pooled
+        # connections are ready before the first request. Failures here are
+        # non-fatal: the adapter lazily builds the client on first use, and the
+        # legacy path is unaffected.
+        try:
+            from .adapters.codebuddy import get_adapter
+            await get_adapter().startup()
+        except Exception:
+            logger.exception("CodeBuddyAdapterV2 startup skipped")
         logger.info("HTTP connection pool and API key pool initialized")
 
     @staticmethod
@@ -139,6 +150,12 @@ class AppLifecycleManager:
         logger.info("CodeBuddy Router shutting down...")
         await codebuddy_api_key_manager.stop_periodic_reload()
         await close_http_client()
+        # Close the CodeBuddyAdapterV2 shared HTTP client as well.
+        try:
+            from .adapters.codebuddy import get_adapter
+            await get_adapter().shutdown()
+        except Exception:
+            logger.exception("CodeBuddyAdapterV2 shutdown skipped")
         logger.info("Resource cleanup complete")
 
 # Export the lifecycle manager for use by the main application
@@ -1175,6 +1192,30 @@ async def chat_completions(
         return openai_error_response(
             "Invalid JSON request body", "invalid_request_error", "invalid_json", 400
         )
+
+    # Feature-flag dispatch (spec §1). When CODEBUDDY_ADAPTER_VERSION=v2 the
+    # isolated CodeBuddyAdapterV2 owns the entire request lifecycle. The import
+    # is lazy and guarded so a partially-built or unavailable adapter falls back
+    # to the legacy handler below rather than taking the endpoint down. The
+    # legacy path is preserved verbatim and selectable via
+    # CODEBUDDY_ADAPTER_VERSION=legacy.
+    if get_codebuddy_adapter_version() == "v2":
+        try:
+            from .adapters.codebuddy import get_adapter
+        except Exception:
+            logger.exception(
+                "CodeBuddyAdapterV2 is unavailable; falling back to the legacy handler"
+            )
+        else:
+            return await get_adapter().chat_completion(
+                request=request,
+                request_body=request_body,
+                auth_context=auth_context,
+                conversation_id=x_conversation_id,
+                conversation_request_id=x_conversation_request_id,
+                conversation_message_id=x_conversation_message_id,
+                request_id=x_request_id,
+            )
 
     try:
         RequestProcessor.validate_request(request_body)
