@@ -29,6 +29,8 @@ from .codebuddy_message_sanitizer import (
     sanitize_messages,
 )
 from config import (
+    get_codebuddy_default_model,
+    get_codebuddy_model_aliases,
     get_codebuddy_request_profile,
     get_max_system_prompt_length,
     get_sanitize_agent_prompt,
@@ -527,46 +529,74 @@ def _key_fingerprint(token: Optional[str]) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
 
 
-def _log_request_diagnostics(
-    *,
-    payload: Dict[str, Any],
-    client_wants_stream: bool,
-    system_prompt_sanitized: bool,
-    request_profile: str,
-    key_fingerprint: str,
-) -> None:
-    """Log request metadata only. Never logs keys, prompts, or user content."""
-    messages = payload.get("messages", []) or []
+def _content_types_and_lengths(messages: List[Any]) -> tuple[List[str], List[str], List[int], int]:
+    """Return (roles, content_types, content_lengths, tool_content_count).
+
+    Metadata only: describes the shape of each message without exposing text.
+    """
     roles: List[str] = []
+    content_types: List[str] = []
     content_lengths: List[int] = []
-    tool_count = 0
+    tool_content_count = 0
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         roles.append(str(msg.get("role", "unknown")))
         content = msg.get("content", "")
         if isinstance(content, str):
+            content_types.append("str")
             content_lengths.append(len(content))
         elif isinstance(content, list):
+            content_types.append("list")
             length = 0
             for item in content:
                 if isinstance(item, dict):
                     if item.get("type") in {"tool_use", "tool_result"}:
-                        tool_count += 1
-                    length += len(str(item.get("text", ""))) if item.get("type") == "text" else 0
+                        tool_content_count += 1
+                    if item.get("type") == "text":
+                        length += len(str(item.get("text", "")))
             content_lengths.append(length)
         else:
+            content_types.append(type(content).__name__)
             content_lengths.append(0)
-    tool_count += len(payload.get("tools", []) or [])
+    return roles, content_types, content_lengths, tool_content_count
+
+
+def _log_request_diagnostics(
+    *,
+    payload: Dict[str, Any],
+    prep_info: Dict[str, Any],
+    client_wants_stream: bool,
+    request_profile: str,
+    key_fingerprint: str,
+    outcome: str = "prepared",
+) -> None:
+    """Log safe request metadata for successful and failed requests.
+
+    Never logs message contents, raw keys, or the mapped-away model label as
+    text beyond what the client requested. ``outcome`` tags the log point
+    (e.g. "prepared", "success", "failed:<code>").
+    """
+    messages = payload.get("messages", []) or []
+    roles, content_types, content_lengths, tool_content_count = _content_types_and_lengths(messages)
+    tool_count = tool_content_count + len(payload.get("tools", []) or [])
     logger.info(
-        "CodeBuddy request model=%s stream=%s roles=[%s] content_lengths=%s "
-        "tool_count=%d system_prompt_sanitized=%s request_profile=%s key_fingerprint=%s",
-        payload.get("model", "unknown"),
+        "CodeBuddy request outcome=%s requested_model=%s mapped_model=%s stream=%s "
+        "roles=[%s] content_types=[%s] content_lengths=%s has_tools=%s has_tool_choice=%s "
+        "tool_count=%d dropped_fields=[%s] system_prompt_sanitized=%s request_profile=%s "
+        "key_fingerprint=%s",
+        outcome,
+        prep_info.get("requested_model", "unknown"),
+        prep_info.get("mapped_model", payload.get("model", "unknown")),
         client_wants_stream,
         ",".join(roles),
+        ",".join(content_types),
         content_lengths,
+        "tools" in payload,
+        "tool_choice" in payload,
         tool_count,
-        system_prompt_sanitized,
+        ",".join(prep_info.get("dropped_fields", []) or []),
+        prep_info.get("system_prompt_sanitized", False),
         request_profile,
         key_fingerprint,
     )
@@ -784,18 +814,76 @@ class CodeBuddyStreamService:
 class RequestProcessor:
     """Request preprocessor - thread-safe request handling"""
 
+    # Top-level request fields forwarded to CodeBuddy upstream. Everything else
+    # (OpenAI-only fields the upstream rejects, or unknown UI fields) is dropped.
+    # ``tools`` and ``tool_choice`` are forwarded only when present.
+    _UPSTREAM_ALLOWLIST = {"model", "messages", "stream", "tools", "tool_choice"}
+
     @staticmethod
-    def prepare_payload(request_body: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
-        """Prepare the request payload.
+    def map_model(requested_model: Any) -> str:
+        """Map a client/UI model label to an upstream CodeBuddy model ID.
 
-        Returns the upstream payload and a flag indicating whether an agent
-        system prompt was sanitized. The flag is used only for safe diagnostics
-        and is never sent upstream.
+        A requested model that already matches a configured available model is
+        passed through unchanged. Otherwise a configured alias
+        (CODEBUDDY_MODEL_ALIASES) is applied. Unknown labels fall back to the
+        configured default model so a UI display label (e.g. "Claude Opus 4.7")
+        is never sent to upstream verbatim unless it is a known model ID.
         """
-        payload = request_body.copy()
-        payload["stream"] = True  # CodeBuddy only supports streaming requests
+        try:
+            available = set(get_available_models_list())
+        except Exception:
+            available = set()
+        try:
+            default_model = get_codebuddy_default_model()
+        except Exception:
+            default_model = "auto-chat"
 
-        messages = payload.get("messages", [])
+        if not isinstance(requested_model, str) or not requested_model.strip():
+            return default_model
+        requested = requested_model.strip()
+
+        # Exact match against a known upstream model ID.
+        if requested in available:
+            return requested
+
+        # Configured alias mapping (case-insensitive).
+        try:
+            aliases = get_codebuddy_model_aliases()
+        except Exception:
+            aliases = {}
+        mapped = aliases.get(requested.lower())
+        if mapped:
+            return mapped
+
+        # Unknown label: do not forward it verbatim; use the safe default.
+        logger.info(
+            "Unknown requested model mapped to default: requested_present=%s",
+            bool(requested),
+        )
+        return default_model
+
+    @staticmethod
+    def prepare_payload(request_body: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Build a strict, upstream-safe payload from the client request body.
+
+        Instead of forwarding the client body verbatim, only allowlisted
+        top-level fields are forwarded. This prevents OpenAI-only fields (e.g.
+        response_format, reasoning_effort, stream_options) and unknown UI fields
+        from reaching CodeBuddy, which is the common cause of upstream rejection.
+
+        Returns ``(payload, prep_info)`` where ``prep_info`` carries safe
+        metadata for diagnostics (never message content or keys):
+          * system_prompt_sanitized: bool
+          * requested_model: str
+          * mapped_model: str
+          * dropped_fields: sorted list of ignored top-level field names
+        """
+        source = request_body if isinstance(request_body, dict) else {}
+
+        requested_model = source.get("model")
+        mapped_model = RequestProcessor.map_model(requested_model)
+
+        messages = source.get("messages", []) or []
 
         # Sanitize only agent system prompts that tend to trigger false-positive
         # moderation. User/assistant/tool messages are never modified, and
@@ -827,8 +915,32 @@ class RequestProcessor:
             if isinstance(msg, dict) and msg.get("role") == "system":
                 msg["content"] = apply_keyword_replacement_to_system_message(msg.get("content"))
 
-        payload["messages"] = messages
-        return payload, system_prompt_sanitized
+        # Build the strict upstream payload. CodeBuddy only supports streaming,
+        # so stream is always True upstream; the client's stream preference is
+        # honored separately by the router (aggregate vs pass-through).
+        payload: Dict[str, Any] = {
+            "model": mapped_model,
+            "messages": messages,
+            "stream": True,
+        }
+        # Forward tools / tool_choice only when the client actually sent them.
+        if source.get("tools"):
+            payload["tools"] = source["tools"]
+        if source.get("tool_choice") is not None:
+            payload["tool_choice"] = source["tool_choice"]
+
+        dropped_fields = sorted(
+            key for key in source.keys()
+            if key not in RequestProcessor._UPSTREAM_ALLOWLIST
+        )
+
+        prep_info = {
+            "system_prompt_sanitized": system_prompt_sanitized,
+            "requested_model": requested_model if isinstance(requested_model, str) else "unknown",
+            "mapped_model": mapped_model,
+            "dropped_fields": dropped_fields,
+        }
+        return payload, prep_info
     
     @staticmethod
     def validate_request(request_body: Dict[str, Any]) -> None:
@@ -995,10 +1107,10 @@ async def chat_completions(
                 503,
             )
 
-    payload, system_prompt_sanitized = RequestProcessor.prepare_payload(request_body)
+    payload, prep_info = RequestProcessor.prepare_payload(request_body)
     usage_stats_manager.record_model_usage(payload.get("model", "unknown"))
     service = CodeBuddyStreamService()
-    client_wants_stream = request_body.get("stream", False)
+    client_wants_stream = bool(request_body.get("stream", False)) if isinstance(request_body, dict) else False
     excluded_ids: Set[str] = set()
     last_error: Optional[UpstreamAttemptError] = None
 
@@ -1035,13 +1147,16 @@ async def chat_completions(
                 500,
             )
 
+        key_fingerprint = _key_fingerprint(credential.bearer_token)
+
         # Safe diagnostics: metadata only, never key/prompt/user content.
         _log_request_diagnostics(
             payload=payload,
+            prep_info=prep_info,
             client_wants_stream=client_wants_stream,
-            system_prompt_sanitized=system_prompt_sanitized,
             request_profile=request_profile,
-            key_fingerprint=_key_fingerprint(credential.bearer_token),
+            key_fingerprint=key_fingerprint,
+            outcome="prepared",
         )
 
         headers = codebuddy_api_client.generate_codebuddy_headers(
@@ -1064,6 +1179,14 @@ async def chat_completions(
                 result = await service.handle_non_stream_response(payload, headers)
             if credential.key_id is not None:
                 await codebuddy_api_key_manager.mark_success(credential.key_id)
+            _log_request_diagnostics(
+                payload=payload,
+                prep_info=prep_info,
+                client_wants_stream=client_wants_stream,
+                request_profile=request_profile,
+                key_fingerprint=key_fingerprint,
+                outcome="success",
+            )
             return result
         except CodeBuddyModerationError:
             # The key is valid and the request reached upstream; moderation is
@@ -1089,9 +1212,18 @@ async def chat_completions(
             last_error = error
             await record_attempt_error(credential, error)
             logger.warning(
-                "CodeBuddy upstream attempt failed: source=%s code=%s",
+                "CodeBuddy upstream attempt failed: source=%s code=%s status=%d",
                 credential.source,
                 error.code,
+                error.status_code,
+            )
+            _log_request_diagnostics(
+                payload=payload,
+                prep_info=prep_info,
+                client_wants_stream=client_wants_stream,
+                request_profile=request_profile,
+                key_fingerprint=key_fingerprint,
+                outcome=f"failed:{error.code}",
             )
             if source != "api_key_file" or error.kind == "fatal":
                 break

@@ -1,0 +1,319 @@
+"""
+Payload-compatibility regression tests for /codebuddy/v1/chat/completions.
+
+Reproduces the reported bug: Claude Code works through 9Router + CodeBuddy2API,
+but the Shiteru web chat fails ("Upstream CodeBuddy request failed" / empty
+reply) because its request body carries OpenAI-only fields and/or a UI model
+label that CodeBuddy rejects.
+
+The fix builds a strict upstream allowlist (model, messages, stream, tools,
+tool_choice) and maps model aliases before calling CodeBuddy. These tests lock
+in that behavior with the two exact request shapes plus unit coverage of the
+allowlist and model mapping.
+
+Uses a mock upstream transport; no real CodeBuddy API key is required.
+"""
+import json
+
+import httpx
+import pytest
+
+from src import auth, codebuddy_router
+from src.codebuddy_router import RequestProcessor
+from src.codebuddy_api_key_manager import CodeBuddyApiKeyManager
+
+RELAY_PASSWORD = "relay-password"
+ADMIN_PASSWORD = "admin-password"
+KEY_A = "passthrough-account-alpha-0001"
+
+AVAILABLE_MODELS = ["claude-4.0", "gpt-5", "auto-chat"]
+
+# OpenAI fields Shiteru-style clients send that CodeBuddy does not accept.
+UNSUPPORTED_FIELDS = {
+    "response_format": {"type": "json_object"},
+    "parallel_tool_calls": False,
+    "reasoning_effort": "high",
+    "stream_options": {"include_usage": True},
+    "service_tier": "auto",
+    "store": True,
+    "metadata": {"session": "abc"},
+    "seed": 42,
+    "logprobs": True,
+    "top_logprobs": 5,
+    "prediction": {"type": "content", "content": "x"},
+    "modalities": ["text"],
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "max_tokens": 1024,
+    "user": "shiteru-web",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Unit: model mapping
+# --------------------------------------------------------------------------- #
+
+
+def _patch_models(monkeypatch, aliases=None, default="auto-chat"):
+    monkeypatch.setattr(codebuddy_router, "get_available_models_list", lambda: list(AVAILABLE_MODELS))
+    monkeypatch.setattr(codebuddy_router, "get_codebuddy_default_model", lambda: default)
+    monkeypatch.setattr(codebuddy_router, "get_codebuddy_model_aliases", lambda: dict(aliases or {}))
+
+
+def test_known_model_passthrough(monkeypatch):
+    _patch_models(monkeypatch)
+    assert RequestProcessor.map_model("claude-4.0") == "claude-4.0"
+
+
+def test_alias_mapped_case_insensitively(monkeypatch):
+    _patch_models(monkeypatch, aliases={"claude opus 4.7": "claude-4.0"})
+    assert RequestProcessor.map_model("Claude Opus 4.7") == "claude-4.0"
+
+
+def test_unknown_label_falls_back_to_default(monkeypatch):
+    _patch_models(monkeypatch, default="auto-chat")
+    # A UI display label with no alias must NOT be forwarded verbatim.
+    assert RequestProcessor.map_model("Claude Opus 4.7") == "auto-chat"
+
+
+def test_missing_model_uses_default(monkeypatch):
+    _patch_models(monkeypatch, default="auto-chat")
+    assert RequestProcessor.map_model(None) == "auto-chat"
+    assert RequestProcessor.map_model("") == "auto-chat"
+
+
+# --------------------------------------------------------------------------- #
+# Unit: allowlist
+# --------------------------------------------------------------------------- #
+
+
+def test_prepare_payload_drops_unsupported_fields(monkeypatch):
+    _patch_models(monkeypatch)
+    monkeypatch.setattr(codebuddy_router, "get_sanitize_agent_prompt", lambda: True)
+    monkeypatch.setattr(codebuddy_router, "get_max_system_prompt_length", lambda: 2000)
+
+    body = {
+        "model": "claude-4.0",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+        "tools": [{"type": "function", "function": {"name": "f"}}],
+        "tool_choice": "auto",
+        **UNSUPPORTED_FIELDS,
+    }
+    payload, prep = RequestProcessor.prepare_payload(body)
+
+    # Only allowlisted fields survive.
+    assert set(payload.keys()) == {"model", "messages", "stream", "tools", "tool_choice"}
+    # Upstream always receives stream=True (CodeBuddy is SSE-only).
+    assert payload["stream"] is True
+    # Every unsupported field is reported as dropped.
+    for field in UNSUPPORTED_FIELDS:
+        assert field in prep["dropped_fields"]
+    assert prep["mapped_model"] == "claude-4.0"
+
+
+def test_prepare_payload_omits_absent_tools(monkeypatch):
+    _patch_models(monkeypatch)
+    monkeypatch.setattr(codebuddy_router, "get_sanitize_agent_prompt", lambda: True)
+    monkeypatch.setattr(codebuddy_router, "get_max_system_prompt_length", lambda: 2000)
+
+    body = {"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]}
+    payload, _prep = RequestProcessor.prepare_payload(body)
+    assert "tools" not in payload
+    assert "tool_choice" not in payload
+
+
+# --------------------------------------------------------------------------- #
+# Integration fixtures
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def app():
+    from fastapi import FastAPI
+
+    from src import codebuddy_auth_router, settings_router
+
+    application = FastAPI()
+    application.include_router(codebuddy_router.router, prefix="/codebuddy")
+    application.include_router(codebuddy_auth_router.router, prefix="/codebuddy")
+    application.include_router(settings_router.router, prefix="/api")
+    return application
+
+
+@pytest.fixture
+async def empty_pool(monkeypatch, tmp_path):
+    path = tmp_path / "keys.txt"
+    path.write_text("", encoding="utf-8")
+    manager = CodeBuddyApiKeyManager(str(path), reload_interval=0)
+    await manager.reload()
+    monkeypatch.setattr(codebuddy_router, "codebuddy_api_key_manager", manager)
+    return manager
+
+
+def configure(monkeypatch, aliases=None, default="auto-chat"):
+    monkeypatch.setattr(auth, "get_client_auth_mode", lambda: "passthrough")
+    monkeypatch.setattr(auth, "get_server_password", lambda: RELAY_PASSWORD)
+    monkeypatch.setattr(auth, "get_admin_password", lambda: ADMIN_PASSWORD)
+    monkeypatch.setattr(codebuddy_router, "get_upstream_api_key_header", lambda: "both")
+    monkeypatch.setattr(codebuddy_router, "get_codebuddy_request_profile", lambda: "web")
+    monkeypatch.setattr(codebuddy_router, "get_sanitize_agent_prompt", lambda: True)
+    monkeypatch.setattr(codebuddy_router, "get_max_system_prompt_length", lambda: 2000)
+    _patch_models(monkeypatch, aliases=aliases, default=default)
+    monkeypatch.setattr(
+        codebuddy_router.usage_stats_manager, "record_model_usage", lambda _m: None
+    )
+
+
+def install_upstream(monkeypatch, handler):
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def get_client():
+        return client
+
+    monkeypatch.setattr(codebuddy_router, "get_http_client", get_client)
+    return client
+
+
+def sse(text, finish="stop"):
+    body = (
+        'data: {"id":"chat-1","model":"auto-chat","choices":'
+        f'[{{"delta":{{"content":{json.dumps(text)}}},"finish_reason":{json.dumps(finish)}}}]}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+
+async def post(app, token, body):
+    transport = httpx.ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.post(
+            "/codebuddy/v1/chat/completions", headers=headers, json=body
+        )
+
+
+# --------------------------------------------------------------------------- #
+# The two exact request shapes
+# --------------------------------------------------------------------------- #
+
+# A Claude Code request: valid model, system + user messages, tools, streaming.
+CLAUDE_CODE_REQUEST = {
+    "model": "claude-4.0",
+    "messages": [
+        {"role": "system", "content": "You are a concise assistant."},
+        {"role": "user", "content": "list two prime numbers"},
+    ],
+    "stream": True,
+    "tools": [
+        {
+            "type": "function",
+            "function": {"name": "noop", "parameters": {"type": "object"}},
+        }
+    ],
+    "tool_choice": "auto",
+}
+
+# A Shiteru web-chat request: UI display-label model + many OpenAI-only fields
+# and stream=false. This is the shape that currently fails upstream.
+SHITERU_WEB_REQUEST = {
+    "model": "Claude Opus 4.7",
+    "messages": [{"role": "user", "content": "halo, siapa kamu"}],
+    "stream": False,
+    "response_format": {"type": "text"},
+    "reasoning_effort": "medium",
+    "parallel_tool_calls": True,
+    "stream_options": {"include_usage": True},
+    "temperature": 0.6,
+    "top_p": 1.0,
+    "max_tokens": 800,
+    "metadata": {"ui": "shiteru"},
+    "seed": 7,
+}
+
+
+@pytest.mark.asyncio
+async def test_claude_code_request_succeeds(monkeypatch, app, empty_pool):
+    configure(monkeypatch)
+    seen = {}
+
+    def handler(req):
+        seen["body"] = json.loads(req.content)
+        return sse("2 and 3")
+
+    upstream = install_upstream(monkeypatch, handler)
+    response = await post(app, KEY_A, CLAUDE_CODE_REQUEST)
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    # Streaming client -> SSE passthrough.
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "[DONE]" in response.text
+    # Upstream received only allowlisted fields, model unchanged, stream=True.
+    body = seen["body"]
+    assert set(body.keys()) == {"model", "messages", "stream", "tools", "tool_choice"}
+    assert body["model"] == "claude-4.0"
+    assert body["stream"] is True
+    assert body["tools"] == CLAUDE_CODE_REQUEST["tools"]
+
+
+@pytest.mark.asyncio
+async def test_shiteru_web_request_now_succeeds(monkeypatch, app, empty_pool):
+    # Map the UI label so it resolves to a real upstream model.
+    configure(monkeypatch, aliases={"claude opus 4.7": "claude-4.0"})
+    seen = {}
+
+    def handler(req):
+        seen["body"] = json.loads(req.content)
+        return sse("Halo! Saya asisten AI.")
+
+    upstream = install_upstream(monkeypatch, handler)
+    response = await post(app, KEY_A, SHITERU_WEB_REQUEST)
+    await upstream.aclose()
+
+    # No more "Upstream CodeBuddy request failed": a proper ChatCompletion.
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    data = response.json()
+    assert data["object"] == "chat.completion"
+    choice = data["choices"][0]
+    assert choice["message"]["role"] == "assistant"
+    assert choice["message"]["content"] == "Halo! Saya asisten AI."
+    assert choice["finish_reason"] == "stop"
+
+    # Upstream must NOT have received any of the unsupported OpenAI fields...
+    body = seen["body"]
+    assert set(body.keys()) == {"model", "messages", "stream"}
+    for field in (
+        "response_format", "reasoning_effort", "parallel_tool_calls",
+        "stream_options", "temperature", "top_p", "max_tokens", "metadata", "seed",
+    ):
+        assert field not in body
+    # ...and the UI label must be mapped to a real model ID.
+    assert body["model"] == "claude-4.0"
+    # CodeBuddy is SSE-only: upstream stream is always True even for stream=false.
+    assert body["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_shiteru_unmapped_label_uses_default_not_verbatim(
+    monkeypatch, app, empty_pool
+):
+    # No alias configured: the unknown UI label must fall back to the default,
+    # never be sent verbatim.
+    configure(monkeypatch, default="auto-chat")
+    seen = {}
+
+    def handler(req):
+        seen["body"] = json.loads(req.content)
+        return sse("ok")
+
+    upstream = install_upstream(monkeypatch, handler)
+    response = await post(app, KEY_A, SHITERU_WEB_REQUEST)
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert seen["body"]["model"] == "auto-chat"
+    assert seen["body"]["model"] != "Claude Opus 4.7"

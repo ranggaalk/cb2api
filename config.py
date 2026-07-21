@@ -41,7 +41,9 @@ _DEFAULT_CONFIG = {
     "CODEBUDDY_UPSTREAM_API_KEY_HEADER": "bearer",
     "CODEBUDDY_REQUEST_PROFILE": "web",
     "CODEBUDDY_SANITIZE_AGENT_PROMPT": True,
-    "CODEBUDDY_MAX_SYSTEM_PROMPT_LENGTH": 2000
+    "CODEBUDDY_MAX_SYSTEM_PROMPT_LENGTH": 2000,
+    "CODEBUDDY_MODEL_ALIASES": "",
+    "CODEBUDDY_DEFAULT_MODEL": "auto-chat"
 }
 
 # --- Core Functions ---
@@ -160,6 +162,34 @@ def get_codebuddy_request_profile() -> str:
     if profile not in {"web", "cli"}:
         raise ValueError("CODEBUDDY_REQUEST_PROFILE must be web or cli")
     return profile
+
+
+def get_codebuddy_default_model() -> str:
+    value = str(_get_config_value("CODEBUDDY_DEFAULT_MODEL")).strip()
+    return value or "auto-chat"
+
+
+def get_codebuddy_model_aliases() -> Dict[str, str]:
+    """Parse CODEBUDDY_MODEL_ALIASES into a lower-cased alias -> upstream map.
+
+    Format: comma-separated ``alias=upstream`` pairs, e.g.
+    ``Claude Opus 4.7=claude-4.0,gpt-5-ui=gpt-5``. Aliases are matched
+    case-insensitively; upstream IDs are preserved verbatim.
+    """
+    raw = _get_config_value("CODEBUDDY_MODEL_ALIASES")
+    aliases: Dict[str, str] = {}
+    if not raw:
+        return aliases
+    for pair in str(raw).split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        alias, upstream = pair.split("=", 1)
+        alias = alias.strip().lower()
+        upstream = upstream.strip()
+        if alias and upstream:
+            aliases[alias] = upstream
+    return aliases
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
