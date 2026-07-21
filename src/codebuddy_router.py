@@ -8,6 +8,8 @@ import uuid
 import hashlib
 import logging
 import asyncio
+import contextlib
+import contextvars
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, AsyncGenerator, Set
 
@@ -85,24 +87,75 @@ class SecurityConfig:
         return ssl_verify
 
 # --- HTTP client configuration ---
-HTTP_CLIENT_CONFIG = {
-    "verify": SecurityConfig.get_ssl_verify(),
-    "timeout": httpx.Timeout(300.0, connect=30.0, read=300.0),
-    "limits": httpx.Limits(max_keepalive_connections=20, max_connections=100)
-}
+
+def _build_http_client_config() -> Dict[str, Any]:
+    """Build the shared client config from separated upstream timeout settings.
+
+    The read timeout intentionally covers only the wait for the first
+    status/headers response; per-chunk stream reads are governed separately by
+    ``CODEBUDDY_STREAM_READ_TIMEOUT_SECONDS`` (0 = unlimited) enforced in the
+    streaming loop. A single global timeout must never cap an agentic stream.
+    """
+    from config import (
+        get_codebuddy_connect_timeout_seconds,
+        get_codebuddy_pool_timeout_seconds,
+        get_codebuddy_write_timeout_seconds,
+        get_codebuddy_first_byte_timeout_seconds,
+        get_codebuddy_stream_read_timeout_seconds,
+        get_codebuddy_max_keepalive_connections,
+        get_codebuddy_max_connections,
+        get_codebuddy_keepalive_expiry_seconds,
+    )
+
+    connect = get_codebuddy_connect_timeout_seconds()
+    pool = get_codebuddy_pool_timeout_seconds()
+    write = get_codebuddy_write_timeout_seconds()
+    first_byte = get_codebuddy_first_byte_timeout_seconds()
+    stream_read = get_codebuddy_stream_read_timeout_seconds()
+
+    # httpx uses one `read` timeout per read() call. Set it to the larger of the
+    # first-byte deadline and the per-chunk stream read timeout so neither the
+    # initial header wait nor a long inter-chunk gap trips it prematurely. A
+    # value of 0 (unlimited stream read) maps to None (no httpx read timeout);
+    # the first-byte deadline is then enforced explicitly by the caller.
+    read_timeout: Optional[float]
+    if stream_read and stream_read > 0:
+        read_timeout = max(first_byte, stream_read)
+    else:
+        read_timeout = None
+
+    return {
+        "verify": SecurityConfig.get_ssl_verify(),
+        "timeout": httpx.Timeout(
+            connect=connect or None,
+            read=read_timeout,
+            write=write or None,
+            pool=pool or None,
+        ),
+        "limits": httpx.Limits(
+            max_keepalive_connections=get_codebuddy_max_keepalive_connections(),
+            max_connections=get_codebuddy_max_connections(),
+            keepalive_expiry=get_codebuddy_keepalive_expiry_seconds(),
+        ),
+    }
 
 # --- Async-safe HTTP client pool ---
 _http_client_pool: Optional[httpx.AsyncClient] = None
 _client_lock = asyncio.Lock()
 
 async def get_http_client() -> httpx.AsyncClient:
-    """Get the global HTTP client pool - async-safe"""
+    """Get the global HTTP client pool - async-safe.
+
+    A single reusable AsyncClient is created lazily and shared by every request
+    so the connection pool is reused. It is never created per-request and never
+    closed after a single request; only ``close_http_client`` (shutdown) closes it.
+    """
     global _http_client_pool
     if _http_client_pool is None:
         async with _client_lock:
             # Double-checked locking pattern - async version
             if _http_client_pool is None:
-                _http_client_pool = httpx.AsyncClient(**HTTP_CLIENT_CONFIG)
+                _http_client_pool = httpx.AsyncClient(**_build_http_client_config())
     return _http_client_pool
 
 async def close_http_client():
@@ -112,6 +165,130 @@ async def close_http_client():
         if _http_client_pool is not None:
             await _http_client_pool.aclose()
             _http_client_pool = None
+
+
+# --- Request-scoped telemetry ---
+# A contextvar carries the current request_id so stage logs can be correlated
+# without threading it through every call. Never carries prompt/key material.
+_request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "codebuddy_request_id", default="-"
+)
+
+
+def log_stage(stage: str, **fields: Any) -> None:
+    """Emit a single safe stage-telemetry line for the current request.
+
+    Only metadata is logged (durations, counts, statuses, fingerprints). Never
+    logs prompts, keys, tool results, or headers. Field values are rendered as
+    ``key=value`` pairs in a stable order.
+    """
+    request_id = _request_id_var.get()
+    if fields:
+        extra = " " + " ".join(f"{k}={v}" for k, v in fields.items())
+    else:
+        extra = ""
+    logger.info("request_id=%s stage=%s%s", request_id, stage, extra)
+
+
+def _now_ms() -> float:
+    """Monotonic clock in milliseconds for elapsed-time telemetry."""
+    return time.monotonic() * 1000.0
+
+
+# --- Upstream concurrency limiter ---
+# Bounds simultaneous in-flight upstream requests so tool-heavy bursts do not
+# pile up sockets/tasks without limit. Requests beyond the limit wait for a slot
+# up to the queue timeout, then receive HTTP 503. The semaphore is rebuilt when
+# the configured size changes (hot-reload safe).
+_upstream_semaphore: Optional[asyncio.Semaphore] = None
+_upstream_semaphore_size: int = 0
+_semaphore_lock = asyncio.Lock()
+
+
+class UpstreamQueueTimeout(Exception):
+    """Raised when a request cannot acquire an upstream slot within the timeout."""
+
+
+async def _get_upstream_semaphore() -> asyncio.Semaphore:
+    global _upstream_semaphore, _upstream_semaphore_size
+    from config import get_codebuddy_max_concurrent_upstream_requests
+
+    desired = get_codebuddy_max_concurrent_upstream_requests()
+    if _upstream_semaphore is None or desired != _upstream_semaphore_size:
+        async with _semaphore_lock:
+            if _upstream_semaphore is None or desired != _upstream_semaphore_size:
+                _upstream_semaphore = asyncio.Semaphore(desired)
+                _upstream_semaphore_size = desired
+    return _upstream_semaphore
+
+
+class UpstreamSlot:
+    """Async context manager that acquires an upstream concurrency slot.
+
+    Records queue wait time and guarantees the slot is released exactly once.
+    ``release()`` is idempotent and safe to call from either ``__aexit__`` (the
+    non-stream path) or a streaming generator's ``finally`` (the stream path).
+
+    For streaming, ownership is transferred to the generator via ``detach()``
+    so the slot is held for the full stream lifetime and released when the
+    stream ends, errors, or the client disconnects — not when the endpoint's
+    ``async with`` block exits.
+    """
+
+    def __init__(self) -> None:
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._acquired = False
+        self._detached = False
+        self.queue_wait_ms = 0.0
+
+    async def __aenter__(self) -> "UpstreamSlot":
+        from config import get_codebuddy_upstream_queue_timeout_seconds
+
+        self._semaphore = await _get_upstream_semaphore()
+        timeout = get_codebuddy_upstream_queue_timeout_seconds()
+        start = _now_ms()
+        try:
+            if timeout and timeout > 0:
+                await asyncio.wait_for(self._semaphore.acquire(), timeout=timeout)
+            else:
+                await self._semaphore.acquire()
+        except asyncio.TimeoutError as exc:
+            self.queue_wait_ms = _now_ms() - start
+            raise UpstreamQueueTimeout() from exc
+        self._acquired = True
+        self.queue_wait_ms = _now_ms() - start
+        return self
+
+    def release(self) -> None:
+        """Release the slot exactly once; safe to call multiple times.
+
+        Unconditional: used by the streaming generator's ``finally`` (which owns
+        the slot after ``detach()``) and by the non-stream path.
+        """
+        if self._acquired and self._semaphore is not None:
+            self._semaphore.release()
+            self._acquired = False
+
+    def release_unless_detached(self) -> None:
+        """Release only if ownership was NOT handed off to a streaming generator.
+
+        The endpoint's ``finally`` calls this so a live streaming response keeps
+        its slot for the full stream lifetime; the generator releases it later.
+        """
+        if not self._detached:
+            self.release()
+
+    def detach(self) -> None:
+        """Transfer release responsibility to the streaming generator.
+
+        After ``detach()`` neither ``release_unless_detached()`` nor
+        ``__aexit__`` will free the slot; the streaming generator's ``finally``
+        must call ``release()``.
+        """
+        self._detached = True
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.release_unless_detached()
 
 # --- Application lifecycle management ---
 class AppLifecycleManager:
@@ -162,9 +339,13 @@ class AppLifecycleManager:
 lifecycle_manager = AppLifecycleManager()
 
 # --- Standard response headers ---
+# no-transform prevents proxies from buffering/altering the SSE body;
+# X-Accel-Buffering: no disables nginx/proxy response buffering so chunks are
+# flushed to the client incrementally rather than accumulated.
 SSE_HEADERS = {
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "*"
@@ -648,6 +829,49 @@ def _log_request_diagnostics(
     )
 
 
+def _request_size_metadata(payload: Dict[str, Any]) -> tuple[int, int, int]:
+    """Return (message_count, tool_count, total_content_length) as safe metadata.
+
+    ``total_content_length`` counts text characters only; it never includes key
+    or header material and is used for the large-request warning.
+    """
+    messages = payload.get("messages", []) or []
+    _roles, _types, content_lengths, tool_content_count = _content_types_and_lengths(messages)
+    message_count = len(messages)
+    tool_count = tool_content_count + len(payload.get("tools", []) or [])
+    total_content_length = sum(content_lengths)
+    return message_count, tool_count, total_content_length
+
+
+def _log_large_request_warning(payload: Dict[str, Any]) -> None:
+    """Emit a warning (never truncate) when a request exceeds configured thresholds."""
+    try:
+        from config import (
+            get_codebuddy_warn_total_content_length,
+            get_codebuddy_warn_message_count,
+            get_codebuddy_warn_tool_count,
+        )
+        warn_len = get_codebuddy_warn_total_content_length()
+        warn_msgs = get_codebuddy_warn_message_count()
+        warn_tools = get_codebuddy_warn_tool_count()
+    except Exception:
+        return
+
+    message_count, tool_count, total_content_length = _request_size_metadata(payload)
+    if (
+        total_content_length >= warn_len
+        or message_count >= warn_msgs
+        or tool_count >= warn_tools
+    ):
+        log_stage(
+            "large_agentic_request",
+            large_agentic_request="true",
+            message_count=message_count,
+            tool_count=tool_count,
+            total_content_length=total_content_length,
+        )
+
+
 class CodeBuddyStreamService:
     """CodeBuddy streaming service; each method performs exactly one upstream attempt."""
 
@@ -666,14 +890,50 @@ class CodeBuddyStreamService:
         payload: Dict[str, Any],
         headers: Dict[str, str],
         key_id: Optional[str] = None,
+        slot: Optional["UpstreamSlot"] = None,
     ) -> StreamingResponse:
-        """Establish the connection and verify the upstream status before returning a StreamingResponse."""
+        """Open the upstream connection, verify status, then return a StreamingResponse.
+
+        The connection is opened and its status/headers awaited under the
+        first-byte timeout. Only a non-200 status blocks here (so failover can
+        pick another key). On a 200 the StreamingResponse is returned
+        immediately; moderation detection, heartbeats, and per-chunk timeouts
+        all happen inside the streaming generator so the HTTP 200 reaches the
+        downstream client without waiting for the first content chunk. This is
+        what stops requests from stalling silently after ``outcome=prepared``.
+
+        ``slot``, when provided, is released in the generator's ``finally`` so
+        the concurrency slot is held for the full stream lifetime and freed on
+        completion, error, or downstream disconnect.
+        """
+        from config import (
+            get_codebuddy_first_byte_timeout_seconds,
+            get_codebuddy_stream_read_timeout_seconds,
+            get_codebuddy_heartbeat_interval_seconds,
+        )
+
+        first_byte_timeout = get_codebuddy_first_byte_timeout_seconds()
+        stream_read_timeout = get_codebuddy_stream_read_timeout_seconds()
+        heartbeat_interval = get_codebuddy_heartbeat_interval_seconds()
+
         client = await get_http_client()
         request = client.build_request(
             "POST", get_codebuddy_api_url(), json=payload, headers=headers
         )
+        log_stage("upstream_send_start")
+        send_start = _now_ms()
         try:
-            response = await client.send(request, stream=True)
+            # Enforce the first-byte/header deadline explicitly: with an
+            # unlimited stream read timeout the httpx read timeout is None, so
+            # the header wait must be bounded here instead.
+            if first_byte_timeout and first_byte_timeout > 0:
+                response = await asyncio.wait_for(
+                    client.send(request, stream=True), timeout=first_byte_timeout
+                )
+            else:
+                response = await client.send(request, stream=True)
+        except asyncio.TimeoutError as exc:
+            raise UpstreamAttemptError("transient", 504, "upstream_first_byte_timeout") from exc
         except httpx.TimeoutException as exc:
             raise UpstreamAttemptError("transient", 504, "upstream_timeout") from exc
         except httpx.RequestError as exc:
@@ -684,8 +944,14 @@ class CodeBuddyStreamService:
             await response.aclose()
             raise self._classify_status(status_code)
 
-        # Do not expose upstream response headers; only this proxy's fixed SSE headers
-        # are sent downstream after the first chunk is safely available.
+        log_stage(
+            "upstream_headers_received",
+            status=response.status_code,
+            elapsed_ms=round(_now_ms() - send_start, 1),
+        )
+
+        # Do not expose upstream response headers; only this proxy's fixed SSE
+        # headers are sent downstream.
 
         async def converted_chunks():
             buffer = ""
@@ -722,76 +988,161 @@ class CodeBuddyStreamService:
 
         stream = converted_chunks()
 
-        # Pre-buffer the leading chunks so a Mandarin moderation refusal can be
-        # detected before any assistant content is sent downstream. The refusal
-        # is short, so a small buffer suffices; normal replies simply get
-        # replayed afterwards in order.
-        buffered_lines: List[str] = []
-        accumulated_content = ""
-        moderation_detected = False
-        try:
-            async for line in stream:
-                buffered_lines.append(line)
-                if '[DONE]' in line:
-                    break
-                accumulated_content += _extract_delta_content(line)
-                if is_codebuddy_moderation_response(accumulated_content):
-                    moderation_detected = True
-                    break
-                if len(accumulated_content) >= MODERATION_STREAM_BUFFER_CHARS:
-                    break
-        except httpx.TimeoutException as exc:
-            await response.aclose()
-            raise UpstreamAttemptError("transient", 504, "upstream_timeout") from exc
-        except httpx.RequestError as exc:
-            await response.aclose()
-            raise UpstreamAttemptError("transient", 502, "upstream_network_error") from exc
-        except Exception as exc:
-            await response.aclose()
-            raise UpstreamAttemptError("fatal", 502, "upstream_response_invalid") from exc
+        def _release_slot() -> None:
+            if slot is not None:
+                slot.release()
 
-        if moderation_detected:
-            # Nothing normal was sent yet: replace the whole stream with an
-            # OpenAI-compatible content_filter stream. The key is valid, so do
-            # not mark it failed or fail over.
-            await response.aclose()
-
-            async def moderation_core():
-                async for item in _moderation_stream():
-                    yield item
-
-            return StreamingResponse(
-                moderation_core(), media_type="text/event-stream", headers={
-                    **SSE_HEADERS, "X-CodeBuddy-Moderation": "true"
-                }
-            )
+        # Capture the request_id now: the StreamingResponse generator runs in a
+        # separate task after this function returns, so the contextvar must be
+        # re-bound inside it for stage logs to carry the correct request_id.
+        stream_request_id = _request_id_var.get()
 
         async def stream_core():
+            _request_id_var.set(stream_request_id)
+            # A background producer isolates the upstream read from the
+            # heartbeat/timeout timer: timeouts never cancel a read mid-flight
+            # (which would corrupt the httpx stream); they only decide whether
+            # to emit a heartbeat or give up.
+            queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+
+            async def producer():
+                try:
+                    async for line in stream:
+                        await queue.put(("line", line))
+                    await queue.put(("end", None))
+                except httpx.RequestError:
+                    await queue.put(("error", "upstream_stream_error"))
+                except Exception:
+                    await queue.put(("error", "upstream_stream_processing_error"))
+
+            producer_task = asyncio.create_task(producer())
+
+            async def next_event(timeout: Optional[float]):
+                if timeout and timeout > 0:
+                    return await asyncio.wait_for(queue.get(), timeout=timeout)
+                return await queue.get()
+
+            first_chunk_ms: Optional[float] = None
+            chunk_count = 0
+            stream_start = _now_ms()
             try:
+                # --- Phase 1: buffer leading lines to detect a moderation
+                # refusal before any assistant content is emitted. Heartbeats
+                # keep the connection alive while we wait; the first-byte
+                # deadline bounds the wait for the very first line.
+                buffered_lines: List[str] = []
+                accumulated_content = ""
+                moderation_detected = False
+                stream_ended = False
+                first_byte_start = _now_ms()
+
+                while True:
+                    remaining: Optional[float] = None
+                    if first_byte_timeout and first_byte_timeout > 0:
+                        elapsed = (_now_ms() - first_byte_start) / 1000.0
+                        remaining = first_byte_timeout - elapsed
+                        if remaining <= 0:
+                            log_stage("request_failed", reason="first_byte_timeout")
+                            yield format_sse_error(
+                                "Upstream timed out before the first chunk",
+                                "upstream_first_byte_timeout",
+                            )
+                            return
+
+                    wait = None
+                    if heartbeat_interval and heartbeat_interval > 0:
+                        wait = heartbeat_interval
+                    if remaining is not None:
+                        wait = remaining if wait is None else min(wait, remaining)
+
+                    try:
+                        kind, value = await next_event(wait)
+                    except asyncio.TimeoutError:
+                        # Heartbeat only before the first content chunk. It is
+                        # an SSE comment, never assistant content, and never a
+                        # data event, so it cannot corrupt [DONE].
+                        yield ": ping\n\n"
+                        continue
+
+                    if kind == "error":
+                        if key_id is not None:
+                            await codebuddy_api_key_manager.mark_transient_error(
+                                key_id, value
+                            )
+                        yield format_sse_error("Upstream stream interrupted", value)
+                        return
+                    if kind == "end":
+                        stream_ended = True
+                        break
+
+                    line = value
+                    buffered_lines.append(line)
+                    if '[DONE]' in line:
+                        break
+                    accumulated_content += _extract_delta_content(line)
+                    if is_codebuddy_moderation_response(accumulated_content):
+                        moderation_detected = True
+                        break
+                    if len(accumulated_content) >= MODERATION_STREAM_BUFFER_CHARS:
+                        break
+
+                if moderation_detected:
+                    # Nothing normal was sent yet: emit an OpenAI-compatible
+                    # content_filter stream instead. The key is valid, so it is
+                    # not marked failed and no failover occurs.
+                    log_stage("upstream_moderation_detected")
+                    async for item in _moderation_stream():
+                        yield item
+                    return
+
+                # --- Phase 2: flush buffered lines then pass through the rest,
+                # applying the stream-read timeout (0 = unlimited).
+                first_chunk_ms = _now_ms() - stream_start
+                log_stage("upstream_first_chunk", elapsed_ms=round(first_chunk_ms, 1))
                 for line in buffered_lines:
+                    chunk_count += 1
                     yield line
-                async for chunk in stream:
-                    yield chunk
-            except httpx.RequestError:
-                logger.warning("CodeBuddy upstream stream interrupted")
-                if key_id is not None:
-                    await codebuddy_api_key_manager.mark_transient_error(
-                        key_id, "stream_interrupted"
-                    )
-                yield format_sse_error(
-                    "Upstream stream interrupted", "upstream_stream_error"
+
+                if not stream_ended:
+                    while True:
+                        try:
+                            kind, value = await next_event(stream_read_timeout)
+                        except asyncio.TimeoutError:
+                            log_stage("request_failed", reason="stream_read_timeout")
+                            yield format_sse_error(
+                                "Upstream stream idle timeout",
+                                "upstream_stream_idle_timeout",
+                            )
+                            return
+                        if kind == "error":
+                            if key_id is not None:
+                                await codebuddy_api_key_manager.mark_transient_error(
+                                    key_id, value
+                                )
+                            yield format_sse_error("Upstream stream interrupted", value)
+                            return
+                        if kind == "end":
+                            break
+                        chunk_count += 1
+                        yield value
+
+                log_stage(
+                    "upstream_stream_finished",
+                    chunks=chunk_count,
+                    duration_ms=round(_now_ms() - stream_start, 1),
                 )
-            except Exception:
-                logger.error("Unexpected CodeBuddy stream processing error")
-                if key_id is not None:
-                    await codebuddy_api_key_manager.mark_transient_error(
-                        key_id, "stream_processing_error"
-                    )
-                yield format_sse_error(
-                    "Upstream stream interrupted", "upstream_stream_error"
-                )
+            except asyncio.CancelledError:
+                # Downstream disconnected: stop everything, do not retry, do not
+                # leave a background upstream request running.
+                log_stage("downstream_disconnected")
+                raise
             finally:
-                await response.aclose()
+                producer_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await producer_task
+                with contextlib.suppress(Exception):
+                    await response.aclose()
+                _release_slot()
 
         return StreamingResponse(
             stream_core(), media_type="text/event-stream", headers=SSE_HEADERS
@@ -800,12 +1151,32 @@ class CodeBuddyStreamService:
     async def handle_non_stream_response(
         self, payload: Dict[str, Any], headers: Dict[str, str]
     ) -> Dict[str, Any]:
-        """Perform a single non-streaming upstream request and aggregate the SSE response."""
+        """Perform a single non-streaming upstream request and aggregate the SSE response.
+
+        Upstream is always streamed (CodeBuddy only supports streaming); this
+        method aggregates the SSE stream into a single OpenAI-compatible
+        completion. The first-byte deadline bounds the wait for status/headers
+        so a dead upstream fails fast, while the aggregation loop reads chunks
+        as they arrive rather than buffering the whole body up front.
+        """
+        from config import get_codebuddy_first_byte_timeout_seconds
+
+        first_byte_timeout = get_codebuddy_first_byte_timeout_seconds()
+        client = await get_http_client()
+        request = client.build_request(
+            "POST", get_codebuddy_api_url(), json=payload, headers=headers
+        )
+        log_stage("upstream_send_start")
+        send_start = _now_ms()
         try:
-            client = await get_http_client()
-            response = await client.post(
-                get_codebuddy_api_url(), json=payload, headers=headers
-            )
+            if first_byte_timeout and first_byte_timeout > 0:
+                response = await asyncio.wait_for(
+                    client.send(request, stream=True), timeout=first_byte_timeout
+                )
+            else:
+                response = await client.send(request, stream=True)
+        except asyncio.TimeoutError as exc:
+            raise UpstreamAttemptError("transient", 504, "upstream_first_byte_timeout") from exc
         except httpx.TimeoutException as exc:
             raise UpstreamAttemptError("transient", 504, "upstream_timeout") from exc
         except httpx.RequestError as exc:
@@ -815,6 +1186,12 @@ class CodeBuddyStreamService:
             status_code = response.status_code
             await response.aclose()
             raise self._classify_status(status_code)
+
+        log_stage(
+            "upstream_headers_received",
+            status=response.status_code,
+            elapsed_ms=round(_now_ms() - send_start, 1),
+        )
 
         try:
             aggregator = StreamResponseAggregator()
@@ -1186,6 +1563,13 @@ async def chat_completions(
     auth_context: ClientAuthContext = Depends(authenticate_inference)
 ):
     """CodeBuddy V1 chat completions API, supporting relay and per-request passthrough."""
+    # Assign a request_id for stage telemetry. Prefer the client-supplied
+    # X-Request-ID for cross-service correlation (9Router → cb2api) and fall
+    # back to a generated id.
+    request_id = x_request_id or uuid.uuid4().hex
+    _request_id_var.set(request_id)
+    log_stage("request_received")
+
     try:
         request_body = await request.json()
     except Exception:
@@ -1223,6 +1607,7 @@ async def chat_completions(
         return openai_error_response(
             str(exc.detail), "invalid_request_error", "invalid_request", exc.status_code
         )
+    log_stage("request_normalized")
 
     passthrough_credential: Optional[ResolvedCredential] = None
     if auth_context.mode == "passthrough":
@@ -1281,6 +1666,8 @@ async def chat_completions(
             400,
         )
     usage_stats_manager.record_model_usage(payload.get("model", "unknown"))
+    log_stage("request_prepared")
+    _log_large_request_warning(payload)
     service = CodeBuddyStreamService()
     client_wants_stream = bool(request_body.get("stream", False)) if isinstance(request_body, dict) else False
     excluded_ids: Set[str] = set()
@@ -1295,6 +1682,78 @@ async def chat_completions(
             "request_profile_invalid",
             500,
         )
+
+    # Acquire an upstream concurrency slot before making any upstream call so
+    # tool-heavy bursts cannot pile up sockets/tasks without bound. The slot is
+    # released here for the non-stream and error paths; for a successful stream
+    # it is detached and released by the streaming generator instead (held for
+    # the stream's full lifetime).
+    log_stage("upstream_slot_wait_start")
+    slot = UpstreamSlot()
+    try:
+        await slot.__aenter__()
+    except UpstreamQueueTimeout:
+        log_stage(
+            "request_failed",
+            reason="upstream_queue_timeout",
+            queue_wait_ms=round(slot.queue_wait_ms, 1),
+        )
+        return openai_error_response(
+            "CodeBuddy relay is temporarily at capacity",
+            "server_overloaded",
+            "upstream_queue_timeout",
+            503,
+        )
+    log_stage("upstream_slot_acquired", queue_wait_ms=round(slot.queue_wait_ms, 1))
+
+    try:
+        return await _run_attempts(
+            request=request,
+            service=service,
+            slot=slot,
+            payload=payload,
+            prep_info=prep_info,
+            source=source,
+            max_attempts=max_attempts,
+            passthrough_credential=passthrough_credential,
+            client_wants_stream=client_wants_stream,
+            request_profile=request_profile,
+            x_conversation_id=x_conversation_id,
+            x_conversation_request_id=x_conversation_request_id,
+            x_conversation_message_id=x_conversation_message_id,
+            x_request_id=x_request_id,
+        )
+    finally:
+        # Release the slot unless a streaming response took ownership of it
+        # (a live stream holds its slot until its generator's finally runs).
+        slot.release_unless_detached()
+
+
+async def _run_attempts(
+    *,
+    request: Request,
+    service: "CodeBuddyStreamService",
+    slot: "UpstreamSlot",
+    payload: Dict[str, Any],
+    prep_info: Dict[str, Any],
+    source: str,
+    max_attempts: int,
+    passthrough_credential: Optional["ResolvedCredential"],
+    client_wants_stream: bool,
+    request_profile: str,
+    x_conversation_id: Optional[str],
+    x_conversation_request_id: Optional[str],
+    x_conversation_message_id: Optional[str],
+    x_request_id: Optional[str],
+):
+    """Run the credential/failover attempt loop for a prepared request.
+
+    A concurrency ``slot`` is already held. On a successful streaming response
+    the slot is detached so the streaming generator owns its release; on every
+    other path the caller's ``finally`` releases it.
+    """
+    excluded_ids: Set[str] = set()
+    last_error: Optional[UpstreamAttemptError] = None
 
     for _attempt in range(max_attempts):
         if source == "passthrough":
@@ -1345,8 +1804,11 @@ async def chat_completions(
         try:
             if client_wants_stream:
                 result = await service.open_stream_response(
-                    payload, headers, credential.key_id
+                    payload, headers, credential.key_id, slot=slot
                 )
+                # The stream is live and owns the concurrency slot for its full
+                # lifetime; hand off release responsibility to its generator.
+                slot.detach()
             else:
                 result = await service.handle_non_stream_response(payload, headers)
             if credential.key_id is not None:
