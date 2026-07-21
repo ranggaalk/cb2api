@@ -25,13 +25,16 @@ from .codebuddy_token_manager import codebuddy_token_manager
 from .usage_stats_manager import usage_stats_manager
 from .keyword_replacer import apply_keyword_replacement_to_system_message
 from .codebuddy_message_sanitizer import (
+    MessageNormalizationError,
     is_codebuddy_moderation_response,
+    normalize_messages_for_upstream,
     sanitize_messages,
 )
 from config import (
     get_codebuddy_default_model,
     get_codebuddy_model_aliases,
     get_codebuddy_request_profile,
+    get_codebuddy_unknown_model_policy,
     get_max_system_prompt_length,
     get_sanitize_agent_prompt,
     get_upstream_api_key_header,
@@ -468,6 +471,19 @@ class CodeBuddyModerationError(Exception):
     """
 
 
+class UnknownModelError(Exception):
+    """Raised when a requested model is unknown and the policy is 'reject'.
+
+    Signals that the request must be rejected with HTTP 400 (code
+    ``unknown_model``) before any upstream call, instead of silently rewriting
+    the requested model to a fallback.
+    """
+
+    def __init__(self, requested_model: str):
+        super().__init__(requested_model)
+        self.requested_model = requested_model
+
+
 # Human-readable message returned to the client on a moderation rejection.
 MODERATION_MESSAGE = (
     "CodeBuddy rejected the request through its content moderation system. "
@@ -570,24 +586,34 @@ def _log_request_diagnostics(
     request_profile: str,
     key_fingerprint: str,
     outcome: str = "prepared",
+    upstream_response_model: Optional[str] = None,
 ) -> None:
     """Log safe request metadata for successful and failed requests.
 
     Never logs message contents, raw keys, or the mapped-away model label as
     text beyond what the client requested. ``outcome`` tags the log point
     (e.g. "prepared", "success", "failed:<code>").
+
+    ``requested_model`` (what the client asked for), ``mapped_model`` (what we
+    send upstream), ``mapping_source`` (how it was resolved), and
+    ``upstream_response_model`` (what CodeBuddy actually reported) are logged
+    separately so a divergence between the selected UI model and the upstream
+    model is visible rather than hidden.
     """
     messages = payload.get("messages", []) or []
     roles, content_types, content_lengths, tool_content_count = _content_types_and_lengths(messages)
     tool_count = tool_content_count + len(payload.get("tools", []) or [])
     logger.info(
-        "CodeBuddy request outcome=%s requested_model=%s mapped_model=%s stream=%s "
+        "CodeBuddy request outcome=%s requested_model=%s mapped_model=%s mapping_source=%s "
+        "upstream_response_model=%s stream=%s "
         "roles=[%s] content_types=[%s] content_lengths=%s has_tools=%s has_tool_choice=%s "
         "tool_count=%d dropped_fields=[%s] system_prompt_sanitized=%s request_profile=%s "
         "key_fingerprint=%s",
         outcome,
         prep_info.get("requested_model", "unknown"),
         prep_info.get("mapped_model", payload.get("model", "unknown")),
+        prep_info.get("mapping_source", "unknown"),
+        upstream_response_model or "unknown",
         client_wants_stream,
         ",".join(roles),
         ",".join(content_types),
@@ -820,14 +846,22 @@ class RequestProcessor:
     _UPSTREAM_ALLOWLIST = {"model", "messages", "stream", "tools", "tool_choice"}
 
     @staticmethod
-    def map_model(requested_model: Any) -> str:
-        """Map a client/UI model label to an upstream CodeBuddy model ID.
+    def resolve_model(requested_model: Any) -> tuple[str, str]:
+        """Resolve a client/UI model label to an upstream CodeBuddy model ID.
 
-        A requested model that already matches a configured available model is
-        passed through unchanged. Otherwise a configured alias
-        (CODEBUDDY_MODEL_ALIASES) is applied. Unknown labels fall back to the
-        configured default model so a UI display label (e.g. "Claude Opus 4.7")
-        is never sent to upstream verbatim unless it is a known model ID.
+        Returns ``(mapped_model, mapping_source)`` where ``mapping_source`` is:
+          * ``"exact"``          - matched a configured available model ID
+          * ``"alias"``          - matched a configured alias (case-insensitive)
+          * ``"default_empty"``  - no model supplied; used the default
+          * ``"passthrough"``    - unknown label forwarded verbatim
+          * ``"default"``        - unknown label mapped to the default model
+
+        An unknown label (neither a known model ID nor a configured alias) is
+        handled per CODEBUDDY_UNKNOWN_MODEL_POLICY:
+          * ``passthrough`` (default): forward it verbatim and let CodeBuddy
+            accept or reject it. The requested model is never silently rewritten.
+          * ``reject``: raise :class:`UnknownModelError` (HTTP 400 upstream).
+          * ``default``: fall back to CODEBUDDY_DEFAULT_MODEL.
         """
         try:
             available = set(get_available_models_list())
@@ -838,13 +872,16 @@ class RequestProcessor:
         except Exception:
             default_model = "auto-chat"
 
+        # No usable model supplied: there is nothing to pass through, so use
+        # the configured default regardless of policy.
         if not isinstance(requested_model, str) or not requested_model.strip():
-            return default_model
+            return default_model, "default_empty"
         requested = requested_model.strip()
 
-        # Exact match against a known upstream model ID.
+        # Exact match against a known upstream model ID (this covers a client
+        # that explicitly requests "auto-chat").
         if requested in available:
-            return requested
+            return requested, "exact"
 
         # Configured alias mapping (case-insensitive).
         try:
@@ -853,14 +890,34 @@ class RequestProcessor:
             aliases = {}
         mapped = aliases.get(requested.lower())
         if mapped:
-            return mapped
+            return mapped, "alias"
 
-        # Unknown label: do not forward it verbatim; use the safe default.
-        logger.info(
-            "Unknown requested model mapped to default: requested_present=%s",
-            bool(requested),
-        )
-        return default_model
+        # Unknown label: behavior is governed by the configured policy. Never
+        # silently rewrite an unknown model to the default.
+        try:
+            policy = get_codebuddy_unknown_model_policy()
+        except Exception:
+            policy = "passthrough"
+
+        if policy == "reject":
+            logger.info("Unknown requested model rejected (policy=reject)")
+            raise UnknownModelError(requested)
+        if policy == "default":
+            logger.info("Unknown requested model mapped to default (policy=default)")
+            return default_model, "default"
+        # passthrough (default): forward the requested model verbatim so the
+        # real upstream model is preserved and CodeBuddy decides if it is valid.
+        return requested, "passthrough"
+
+    @staticmethod
+    def map_model(requested_model: Any) -> str:
+        """Backward-compatible wrapper returning only the resolved model ID.
+
+        May raise :class:`UnknownModelError` when the unknown-model policy is
+        ``reject``.
+        """
+        mapped, _source = RequestProcessor.resolve_model(requested_model)
+        return mapped
 
     @staticmethod
     def prepare_payload(request_body: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -876,12 +933,16 @@ class RequestProcessor:
           * system_prompt_sanitized: bool
           * requested_model: str
           * mapped_model: str
+          * mapping_source: str (how the model was resolved)
           * dropped_fields: sorted list of ignored top-level field names
+
+        May raise :class:`UnknownModelError` when the requested model is unknown
+        and CODEBUDDY_UNKNOWN_MODEL_POLICY is ``reject``.
         """
         source = request_body if isinstance(request_body, dict) else {}
 
         requested_model = source.get("model")
-        mapped_model = RequestProcessor.map_model(requested_model)
+        mapped_model, mapping_source = RequestProcessor.resolve_model(requested_model)
 
         messages = source.get("messages", []) or []
 
@@ -915,6 +976,16 @@ class RequestProcessor:
             if isinstance(msg, dict) and msg.get("role") == "system":
                 msg["content"] = apply_keyword_replacement_to_system_message(msg.get("content"))
 
+        # Final transform before upstream: after all Anthropic/OpenAI/tool
+        # conversion and system-prompt sanitization, guarantee every message
+        # has a valid role and a content field. This inspects the exact messages
+        # CodeBuddy will receive (e.g. Claude Code assistant tool_calls turns
+        # with null content, or tool-result messages), preventing the upstream
+        # "Message N must have 'role' and 'content' fields" rejection. Raises
+        # MessageNormalizationError (handled by the caller) when a role cannot
+        # be determined.
+        messages = normalize_messages_for_upstream(messages)
+
         # Build the strict upstream payload. CodeBuddy only supports streaming,
         # so stream is always True upstream; the client's stream preference is
         # honored separately by the router (aggregate vs pass-through).
@@ -938,29 +1009,36 @@ class RequestProcessor:
             "system_prompt_sanitized": system_prompt_sanitized,
             "requested_model": requested_model if isinstance(requested_model, str) else "unknown",
             "mapped_model": mapped_model,
+            "mapping_source": mapping_source,
             "dropped_fields": dropped_fields,
         }
         return payload, prep_info
     
     @staticmethod
     def validate_request(request_body: Dict[str, Any]) -> None:
-        """Validate request parameters"""
+        """Validate request structure.
+
+        Only structural invariants are enforced here: the body must be an
+        object with a non-empty ``messages`` array of objects. Role/content
+        completeness is intentionally NOT enforced at this point: valid
+        OpenAI/Anthropic tool-use turns legitimately omit ``content`` (assistant
+        messages carrying ``tool_calls``) or ``role`` (tool results identified
+        by ``tool_call_id``). Those fields are guaranteed later by
+        ``normalize_messages_for_upstream`` immediately before the upstream call,
+        which repairs what it can and returns an indexed 400 for what it cannot.
+        """
         if not isinstance(request_body, dict):
             raise HTTPException(status_code=400, detail="Request body must be a JSON object")
-        
+
         messages = request_body.get("messages")
         if not messages or not isinstance(messages, list):
             raise HTTPException(status_code=400, detail="Messages field is required and must be an array")
-        
-        if not messages:
-            raise HTTPException(status_code=400, detail="At least one message is required")
-        
-        # Validate message format
+
+        # Validate message container type only; field-level normalization runs
+        # later against the final transformed messages.
         for i, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 raise HTTPException(status_code=400, detail=f"Message {i} must be an object")
-            if "role" not in msg or "content" not in msg:
-                raise HTTPException(status_code=400, detail=f"Message {i} must have 'role' and 'content' fields")
 
 @dataclass(repr=False)
 class ResolvedCredential:
@@ -1107,7 +1185,35 @@ async def chat_completions(
                 503,
             )
 
-    payload, prep_info = RequestProcessor.prepare_payload(request_body)
+    try:
+        payload, prep_info = RequestProcessor.prepare_payload(request_body)
+    except UnknownModelError as exc:
+        logger.info(
+            "Rejecting unknown requested model (policy=reject): requested_present=%s",
+            bool(exc.requested_model),
+        )
+        return openai_error_response(
+            f"Unknown model: {exc.requested_model}",
+            "invalid_request_error",
+            "unknown_model",
+            400,
+        )
+    except MessageNormalizationError as exc:
+        # A message reached the upstream boundary without a determinable role.
+        # Reject locally with the offending index instead of forwarding malformed
+        # data that CodeBuddy rejects with a generic "must have 'role' and
+        # 'content'" error.
+        logger.info(
+            "Rejecting malformed upstream message: index=%d reason=%s",
+            exc.index,
+            exc.reason,
+        )
+        return openai_error_response(
+            f"Message {exc.index} is malformed: {exc.reason}",
+            "invalid_request_error",
+            "invalid_message",
+            400,
+        )
     usage_stats_manager.record_model_usage(payload.get("model", "unknown"))
     service = CodeBuddyStreamService()
     client_wants_stream = bool(request_body.get("stream", False)) if isinstance(request_body, dict) else False
@@ -1179,6 +1285,12 @@ async def chat_completions(
                 result = await service.handle_non_stream_response(payload, headers)
             if credential.key_id is not None:
                 await codebuddy_api_key_manager.mark_success(credential.key_id)
+            # For the non-stream path we have the aggregated upstream response
+            # and can log the model CodeBuddy actually reported. It is logged
+            # separately and never used to rewrite the response model.
+            upstream_response_model = (
+                result.get("model") if isinstance(result, dict) else None
+            )
             _log_request_diagnostics(
                 payload=payload,
                 prep_info=prep_info,
@@ -1186,6 +1298,7 @@ async def chat_completions(
                 request_profile=request_profile,
                 key_fingerprint=key_fingerprint,
                 outcome="success",
+                upstream_response_model=upstream_response_model,
             )
             return result
         except CodeBuddyModerationError:

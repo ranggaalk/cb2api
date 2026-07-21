@@ -43,7 +43,8 @@ _DEFAULT_CONFIG = {
     "CODEBUDDY_SANITIZE_AGENT_PROMPT": True,
     "CODEBUDDY_MAX_SYSTEM_PROMPT_LENGTH": 2000,
     "CODEBUDDY_MODEL_ALIASES": "",
-    "CODEBUDDY_DEFAULT_MODEL": "auto-chat"
+    "CODEBUDDY_DEFAULT_MODEL": "auto-chat",
+    "CODEBUDDY_UNKNOWN_MODEL_POLICY": "passthrough"
 }
 
 # --- Core Functions ---
@@ -167,6 +168,23 @@ def get_codebuddy_request_profile() -> str:
 def get_codebuddy_default_model() -> str:
     value = str(_get_config_value("CODEBUDDY_DEFAULT_MODEL")).strip()
     return value or "auto-chat"
+
+
+def get_codebuddy_unknown_model_policy() -> str:
+    """How to handle a requested model that is neither a known upstream model
+    ID nor a configured alias.
+
+      * passthrough (default): forward the requested model verbatim and let
+        CodeBuddy accept or reject it. Never silently rewrite it.
+      * reject: return HTTP 400 (code=unknown_model) without calling upstream.
+      * default: fall back to CODEBUDDY_DEFAULT_MODEL.
+    """
+    policy = str(_get_config_value("CODEBUDDY_UNKNOWN_MODEL_POLICY")).strip().lower()
+    if policy not in {"passthrough", "reject", "default"}:
+        raise ValueError(
+            "CODEBUDDY_UNKNOWN_MODEL_POLICY must be passthrough, reject, or default"
+        )
+    return policy
 
 
 def get_codebuddy_model_aliases() -> Dict[str, str]:

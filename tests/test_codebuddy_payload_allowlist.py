@@ -56,32 +56,75 @@ UNSUPPORTED_FIELDS = {
 # --------------------------------------------------------------------------- #
 
 
-def _patch_models(monkeypatch, aliases=None, default="auto-chat"):
+def _patch_models(monkeypatch, aliases=None, default="auto-chat", policy="passthrough"):
     monkeypatch.setattr(codebuddy_router, "get_available_models_list", lambda: list(AVAILABLE_MODELS))
     monkeypatch.setattr(codebuddy_router, "get_codebuddy_default_model", lambda: default)
     monkeypatch.setattr(codebuddy_router, "get_codebuddy_model_aliases", lambda: dict(aliases or {}))
+    monkeypatch.setattr(codebuddy_router, "get_codebuddy_unknown_model_policy", lambda: policy)
 
 
 def test_known_model_passthrough(monkeypatch):
     _patch_models(monkeypatch)
     assert RequestProcessor.map_model("claude-4.0") == "claude-4.0"
+    assert RequestProcessor.resolve_model("claude-4.0") == ("claude-4.0", "exact")
 
 
 def test_alias_mapped_case_insensitively(monkeypatch):
     _patch_models(monkeypatch, aliases={"claude opus 4.7": "claude-4.0"})
     assert RequestProcessor.map_model("Claude Opus 4.7") == "claude-4.0"
+    assert RequestProcessor.resolve_model("Claude Opus 4.7") == ("claude-4.0", "alias")
 
 
-def test_unknown_label_falls_back_to_default(monkeypatch):
-    _patch_models(monkeypatch, default="auto-chat")
-    # A UI display label with no alias must NOT be forwarded verbatim.
-    assert RequestProcessor.map_model("Claude Opus 4.7") == "auto-chat"
+def test_unknown_label_passthrough_by_default(monkeypatch):
+    # Default policy is passthrough: an unknown label is forwarded verbatim,
+    # never silently rewritten to the default model. This is the core bug fix.
+    _patch_models(monkeypatch, default="auto-chat", policy="passthrough")
+    assert RequestProcessor.resolve_model("Claude Opus 4.7") == (
+        "Claude Opus 4.7",
+        "passthrough",
+    )
+    assert RequestProcessor.map_model("Claude Opus 4.7") == "Claude Opus 4.7"
 
 
-def test_missing_model_uses_default(monkeypatch):
-    _patch_models(monkeypatch, default="auto-chat")
-    assert RequestProcessor.map_model(None) == "auto-chat"
-    assert RequestProcessor.map_model("") == "auto-chat"
+def test_unknown_label_default_policy_falls_back(monkeypatch):
+    # Only when policy=default does an unknown label map to the default model.
+    _patch_models(monkeypatch, default="auto-chat", policy="default")
+    assert RequestProcessor.resolve_model("Claude Opus 4.7") == ("auto-chat", "default")
+
+
+def test_unknown_label_reject_policy_raises(monkeypatch):
+    _patch_models(monkeypatch, default="auto-chat", policy="reject")
+    with pytest.raises(codebuddy_router.UnknownModelError) as excinfo:
+        RequestProcessor.resolve_model("Claude Opus 4.7")
+    assert excinfo.value.requested_model == "Claude Opus 4.7"
+
+
+def test_missing_model_uses_default_under_every_policy(monkeypatch):
+    # A missing/blank model has nothing to pass through, so it uses the default
+    # regardless of policy (and never raises under reject).
+    for policy in ("passthrough", "default", "reject"):
+        _patch_models(monkeypatch, default="auto-chat", policy=policy)
+        assert RequestProcessor.resolve_model(None) == ("auto-chat", "default_empty")
+        assert RequestProcessor.resolve_model("") == ("auto-chat", "default_empty")
+        assert RequestProcessor.map_model(None) == "auto-chat"
+
+
+def test_explicit_auto_chat_request_is_exact_not_default(monkeypatch):
+    # A client explicitly asking for auto-chat matches exactly; it is not the
+    # unknown-model fallback path.
+    _patch_models(monkeypatch, default="auto-chat", policy="reject")
+    assert RequestProcessor.resolve_model("auto-chat") == ("auto-chat", "exact")
+
+
+def test_opus_4_7_1m_is_not_converted_to_auto_chat(monkeypatch):
+    # Regression for the reported log: requested_model=claude-opus-4.7-1m must
+    # NOT be silently mapped to auto-chat. Under the default passthrough policy
+    # it is forwarded verbatim so the real upstream model is preserved.
+    _patch_models(monkeypatch, default="auto-chat", policy="passthrough")
+    mapped, source = RequestProcessor.resolve_model("claude-opus-4.7-1m")
+    assert mapped == "claude-opus-4.7-1m"
+    assert mapped != "auto-chat"
+    assert source == "passthrough"
 
 
 # --------------------------------------------------------------------------- #
@@ -153,7 +196,7 @@ async def empty_pool(monkeypatch, tmp_path):
     return manager
 
 
-def configure(monkeypatch, aliases=None, default="auto-chat"):
+def configure(monkeypatch, aliases=None, default="auto-chat", policy="passthrough"):
     monkeypatch.setattr(auth, "get_client_auth_mode", lambda: "passthrough")
     monkeypatch.setattr(auth, "get_server_password", lambda: RELAY_PASSWORD)
     monkeypatch.setattr(auth, "get_admin_password", lambda: ADMIN_PASSWORD)
@@ -161,7 +204,7 @@ def configure(monkeypatch, aliases=None, default="auto-chat"):
     monkeypatch.setattr(codebuddy_router, "get_codebuddy_request_profile", lambda: "web")
     monkeypatch.setattr(codebuddy_router, "get_sanitize_agent_prompt", lambda: True)
     monkeypatch.setattr(codebuddy_router, "get_max_system_prompt_length", lambda: 2000)
-    _patch_models(monkeypatch, aliases=aliases, default=default)
+    _patch_models(monkeypatch, aliases=aliases, default=default, policy=policy)
     monkeypatch.setattr(
         codebuddy_router.usage_stats_manager, "record_model_usage", lambda _m: None
     )
@@ -298,12 +341,61 @@ async def test_shiteru_web_request_now_succeeds(monkeypatch, app, empty_pool):
 
 
 @pytest.mark.asyncio
-async def test_shiteru_unmapped_label_uses_default_not_verbatim(
+async def test_shiteru_unmapped_label_passthrough_by_default(
     monkeypatch, app, empty_pool
 ):
-    # No alias configured: the unknown UI label must fall back to the default,
-    # never be sent verbatim.
-    configure(monkeypatch, default="auto-chat")
+    # No alias configured and default policy (passthrough): the unknown UI label
+    # is forwarded verbatim, NOT silently rewritten to auto-chat.
+    configure(monkeypatch, default="auto-chat", policy="passthrough")
+    seen = {}
+
+    def handler(req):
+        seen["body"] = json.loads(req.content)
+        return sse("ok")
+
+    upstream = install_upstream(monkeypatch, handler)
+    response = await post(app, KEY_A, SHITERU_WEB_REQUEST)
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert seen["body"]["model"] == "Claude Opus 4.7"
+    assert seen["body"]["model"] != "auto-chat"
+
+
+@pytest.mark.asyncio
+async def test_opus_4_7_1m_not_rewritten_to_auto_chat_integration(
+    monkeypatch, app, empty_pool
+):
+    # End-to-end regression for the reported log line
+    # (requested_model=claude-opus-4.7-1m mapped_model=auto-chat): the real
+    # model ID must reach upstream unchanged under the default policy.
+    configure(monkeypatch, default="auto-chat", policy="passthrough")
+    seen = {}
+
+    def handler(req):
+        seen["body"] = json.loads(req.content)
+        return sse("ok")
+
+    upstream = install_upstream(monkeypatch, handler)
+    body = {
+        "model": "claude-opus-4.7-1m",
+        "messages": [{"role": "user", "content": "halo"}],
+        "stream": False,
+    }
+    response = await post(app, KEY_A, body)
+    await upstream.aclose()
+
+    assert response.status_code == 200
+    assert seen["body"]["model"] == "claude-opus-4.7-1m"
+    assert seen["body"]["model"] != "auto-chat"
+
+
+@pytest.mark.asyncio
+async def test_shiteru_unmapped_label_default_policy_uses_default(
+    monkeypatch, app, empty_pool
+):
+    # Only with policy=default does the unknown label fall back to the default.
+    configure(monkeypatch, default="auto-chat", policy="default")
     seen = {}
 
     def handler(req):
@@ -316,4 +408,59 @@ async def test_shiteru_unmapped_label_uses_default_not_verbatim(
 
     assert response.status_code == 200
     assert seen["body"]["model"] == "auto-chat"
-    assert seen["body"]["model"] != "Claude Opus 4.7"
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_reject_policy_returns_400(monkeypatch, app, empty_pool):
+    # policy=reject: an unknown model is rejected with HTTP 400 code=unknown_model
+    # before any upstream call is made.
+    configure(monkeypatch, default="auto-chat", policy="reject")
+    called = {"upstream": False}
+
+    def handler(req):
+        called["upstream"] = True
+        return sse("should not be called")
+
+    upstream = install_upstream(monkeypatch, handler)
+    response = await post(app, KEY_A, SHITERU_WEB_REQUEST)
+    await upstream.aclose()
+
+    assert response.status_code == 400
+    assert called["upstream"] is False
+    error = response.json()["error"]
+    assert error["code"] == "unknown_model"
+    assert error["type"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_passthrough_preserves_upstream_400_no_fallback(
+    monkeypatch, app, empty_pool
+):
+    # Requirement 10: if CodeBuddy rejects the passed-through model with a 400,
+    # that rejection is surfaced rather than retried with a different model.
+    configure(monkeypatch, default="auto-chat", policy="passthrough")
+    seen = {"count": 0, "models": []}
+
+    def handler(req):
+        seen["count"] += 1
+        seen["models"].append(json.loads(req.content)["model"])
+        return httpx.Response(
+            400,
+            json={"error": {"message": "unknown model", "code": "model_not_found"}},
+            headers={"content-type": "application/json"},
+        )
+
+    upstream = install_upstream(monkeypatch, handler)
+    body = {
+        "model": "claude-opus-4.7-1m",
+        "messages": [{"role": "user", "content": "halo"}],
+        "stream": False,
+    }
+    response = await post(app, KEY_A, body)
+    await upstream.aclose()
+
+    # Upstream saw exactly one attempt with the verbatim model; no fallback to
+    # auto-chat was attempted.
+    assert seen["count"] == 1
+    assert seen["models"] == ["claude-opus-4.7-1m"]
+    assert response.status_code == 400
