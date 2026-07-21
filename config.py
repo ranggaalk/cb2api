@@ -44,7 +44,28 @@ _DEFAULT_CONFIG = {
     "CODEBUDDY_MAX_SYSTEM_PROMPT_LENGTH": 2000,
     "CODEBUDDY_MODEL_ALIASES": "",
     "CODEBUDDY_DEFAULT_MODEL": "auto-chat",
-    "CODEBUDDY_UNKNOWN_MODEL_POLICY": "passthrough"
+    "CODEBUDDY_UNKNOWN_MODEL_POLICY": "passthrough",
+    # --- Upstream connection / timeout tuning ---
+    # Separate timeouts so a slow-but-alive agentic stream is not killed by the
+    # same deadline that guards opening a connection. See get_codebuddy_* below.
+    "CODEBUDDY_CONNECT_TIMEOUT_SECONDS": 30,
+    "CODEBUDDY_POOL_TIMEOUT_SECONDS": 30,
+    "CODEBUDDY_WRITE_TIMEOUT_SECONDS": 60,
+    "CODEBUDDY_FIRST_BYTE_TIMEOUT_SECONDS": 180,
+    # 0 means unlimited read timeout once the stream is flowing.
+    "CODEBUDDY_STREAM_READ_TIMEOUT_SECONDS": 0,
+    "CODEBUDDY_MAX_KEEPALIVE_CONNECTIONS": 30,
+    "CODEBUDDY_MAX_CONNECTIONS": 100,
+    "CODEBUDDY_KEEPALIVE_EXPIRY_SECONDS": 60,
+    # --- Upstream concurrency limiter ---
+    "CODEBUDDY_MAX_CONCURRENT_UPSTREAM_REQUESTS": 20,
+    "CODEBUDDY_UPSTREAM_QUEUE_TIMEOUT_SECONDS": 60,
+    # --- SSE heartbeat while waiting for the first upstream chunk ---
+    "CODEBUDDY_HEARTBEAT_INTERVAL_SECONDS": 15,
+    # --- Large-request warning thresholds (log only; never truncates) ---
+    "CODEBUDDY_WARN_TOTAL_CONTENT_LENGTH": 50000,
+    "CODEBUDDY_WARN_MESSAGE_COUNT": 40,
+    "CODEBUDDY_WARN_TOOL_COUNT": 30,
 }
 
 # --- Core Functions ---
@@ -277,6 +298,93 @@ def get_codebuddy_api_key_cooldown_seconds() -> int:
     if cooldown < 0:
         raise ValueError("CODEBUDDY_API_KEY_COOLDOWN_SECONDS must be zero or greater")
     return cooldown
+
+
+# --- Upstream connection / timeout tuning ---
+
+def _get_non_negative_float(key: str, default: float) -> float:
+    """Return a validated non-negative float config value (0 allowed)."""
+    try:
+        value = float(_get_config_value(key))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _get_positive_int(key: str, default: int) -> int:
+    """Return a validated strictly-positive int config value."""
+    try:
+        value = int(_get_config_value(key))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def get_codebuddy_connect_timeout_seconds() -> float:
+    return _get_non_negative_float("CODEBUDDY_CONNECT_TIMEOUT_SECONDS", 30.0)
+
+
+def get_codebuddy_pool_timeout_seconds() -> float:
+    return _get_non_negative_float("CODEBUDDY_POOL_TIMEOUT_SECONDS", 30.0)
+
+
+def get_codebuddy_write_timeout_seconds() -> float:
+    return _get_non_negative_float("CODEBUDDY_WRITE_TIMEOUT_SECONDS", 60.0)
+
+
+def get_codebuddy_first_byte_timeout_seconds() -> float:
+    """Deadline for the upstream to return status/headers and the first chunk.
+
+    Distinct from the stream read timeout: this guards the wait *before* the
+    stream starts flowing, so a dead upstream fails fast without capping a
+    long-running agentic stream.
+    """
+    return _get_non_negative_float("CODEBUDDY_FIRST_BYTE_TIMEOUT_SECONDS", 180.0)
+
+
+def get_codebuddy_stream_read_timeout_seconds() -> float:
+    """Per-read timeout once the stream is flowing. 0 means unlimited."""
+    return _get_non_negative_float("CODEBUDDY_STREAM_READ_TIMEOUT_SECONDS", 0.0)
+
+
+def get_codebuddy_max_keepalive_connections() -> int:
+    return _get_positive_int("CODEBUDDY_MAX_KEEPALIVE_CONNECTIONS", 30)
+
+
+def get_codebuddy_max_connections() -> int:
+    return _get_positive_int("CODEBUDDY_MAX_CONNECTIONS", 100)
+
+
+def get_codebuddy_keepalive_expiry_seconds() -> float:
+    return _get_non_negative_float("CODEBUDDY_KEEPALIVE_EXPIRY_SECONDS", 60.0)
+
+
+def get_codebuddy_max_concurrent_upstream_requests() -> int:
+    return _get_positive_int("CODEBUDDY_MAX_CONCURRENT_UPSTREAM_REQUESTS", 20)
+
+
+def get_codebuddy_upstream_queue_timeout_seconds() -> float:
+    return _get_non_negative_float("CODEBUDDY_UPSTREAM_QUEUE_TIMEOUT_SECONDS", 60.0)
+
+
+def get_codebuddy_heartbeat_interval_seconds() -> float:
+    """SSE heartbeat cadence while waiting for the first upstream chunk.
+
+    0 disables heartbeats entirely.
+    """
+    return _get_non_negative_float("CODEBUDDY_HEARTBEAT_INTERVAL_SECONDS", 15.0)
+
+
+def get_codebuddy_warn_total_content_length() -> int:
+    return _get_positive_int("CODEBUDDY_WARN_TOTAL_CONTENT_LENGTH", 50000)
+
+
+def get_codebuddy_warn_message_count() -> int:
+    return _get_positive_int("CODEBUDDY_WARN_MESSAGE_COUNT", 40)
+
+
+def get_codebuddy_warn_tool_count() -> int:
+    return _get_positive_int("CODEBUDDY_WARN_TOOL_COUNT", 30)
 
 # --- Public Setter for Hot-Reload ---
 
